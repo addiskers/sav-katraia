@@ -1,7 +1,7 @@
 /**
- * GeminiClient: Handles WebSocket communication
+ * SarvamClient: Handles WebSocket communication with the Sarvam voice agent
  */
-class GeminiClient {
+class SarvamClient {
   constructor(config) {
     this.websocket = null;
     this.onOpen = config.onOpen;

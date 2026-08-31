@@ -157,7 +157,7 @@ async def summary(filters=None):
     now = datetime.now(timezone.utc)
     month_prefix = now.strftime("%Y-%m")
 
-    total_cost = gemini_cost = twilio_cost = 0.0
+    total_cost = ai_cost = twilio_cost = 0.0
     total_secs = 0
     bookings = 0
     by_source = {}
@@ -168,12 +168,12 @@ async def summary(filters=None):
     month_calls = 0
 
     for m in metas:
-        g = m.get("gemini_cost_usd") or 0.0
+        g = m.get("ai_cost_usd") or 0.0
         tw = ((m.get("twilio") or {}).get("price_usd")) or 0.0
         t = m.get("total_cost_usd")
         if t is None:
             t = g + tw
-        gemini_cost += g
+        ai_cost += g
         twilio_cost += tw
         total_cost += t
         total_secs += m.get("duration_seconds") or 0
@@ -189,10 +189,10 @@ async def summary(filters=None):
         d = _date_of(m)
         if d:
             day = by_day.setdefault(d, {"date": d, "calls": 0, "cost_usd": 0.0,
-                                        "gemini_cost_usd": 0.0})
+                                        "ai_cost_usd": 0.0})
             day["calls"] += 1
             day["cost_usd"] = round(day["cost_usd"] + t, 6)
-            day["gemini_cost_usd"] = round(day["gemini_cost_usd"] + g, 6)
+            day["ai_cost_usd"] = round(day["ai_cost_usd"] + g, 6)
 
         if d.startswith(month_prefix):
             month_cost += t
@@ -214,7 +214,7 @@ async def summary(filters=None):
         "total_minutes": round(total_secs / 60.0, 2),
         "total_seconds": total_secs,
         "total_cost_usd": round(total_cost, 6),
-        "gemini_cost_usd": round(gemini_cost, 6),
+        "ai_cost_usd": round(ai_cost, 6),
         "twilio_cost_usd": round(twilio_cost, 6),
         "avg_cost_per_call": avg_cost,
         "bookings": bookings,

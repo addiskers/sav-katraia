@@ -581,7 +581,7 @@ body::before {
   border-bottom-right-radius: 4px;
 }
 
-.message.gemini {
+.message.agent {
   align-self: flex-start;
   background: linear-gradient(135deg, rgba(124, 58, 237, 0.2), rgba(124, 58, 237, 0.1));
   border: 1px solid rgba(124, 58, 237, 0.15);
@@ -1064,7 +1064,7 @@ body::before {
   color: var(--accent-cyan);
 }
 
-.tr-gemini .tr-role {
+.tr-agent .tr-role {
   color: var(--accent-purple);
 }
 

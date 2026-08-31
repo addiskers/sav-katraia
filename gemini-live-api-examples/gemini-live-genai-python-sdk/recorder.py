@@ -1,6 +1,7 @@
 """
 CallRecorder — taps the live event stream of a single call, accumulates the
-transcript + real token usage, computes cost, and persists via store.py.
+transcript + real AI usage (Deepgram STT seconds, Groq LLM tokens, Sarvam TTS
+characters), computes cost, and persists via store.py.
 
 One instance per call. It is fed the SAME events that already drive the live
 viewer, so it never changes call behavior. Every persistence call is guarded so
@@ -20,22 +21,6 @@ logger = logging.getLogger(__name__)
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
-
-
-def _in_bucket(mod):
-    m = str(mod).upper()
-    if "AUDIO" in m:
-        return "audio_in"
-    if "IMAGE" in m or "VIDEO" in m:
-        return "imgvid_in"
-    return "text_in"
-
-
-def _out_bucket(mod):
-    m = str(mod).upper()
-    if "AUDIO" in m:
-        return "audio_out"
-    return "text_out"
 
 
 def _infer_language(text):
@@ -64,9 +49,9 @@ class CallRecorder:
     def __init__(self, model=None):
         self.model = model
         self.call = None          # the persisted dict (None until open)
-        self._cur_role = None     # 'user' | 'gemini' currently buffering
+        self._cur_role = None     # 'user' | 'agent' currently buffering
         self._cur_text = []
-        self._usage = []          # list of per-event usage snapshots
+        self._usage = pricing._empty_usage()
         self._lang_decided = False
         self._closed = False
         self._started_ts = None
@@ -90,9 +75,9 @@ class CallRecorder:
                 "language": None,
                 "status": "in_progress",
                 "booking_created": False,
-                "gemini_model": self.model,
-                "tokens": pricing._empty_tokens(),
-                "gemini_cost_usd": 0.0,
+                "model": self.model,
+                "ai_usage": pricing._empty_usage(),
+                "ai_cost_usd": 0.0,
                 "twilio": {"price_usd": None, "price_unit": None,
                            "status": None, "duration_seconds": None},
                 "total_cost_usd": 0.0,
@@ -111,7 +96,7 @@ class CallRecorder:
             return
         try:
             etype = event.get("type")
-            if etype in ("user", "gemini"):
+            if etype in ("user", "agent"):
                 self._accumulate_turn(etype, event.get("text", ""))
             elif etype == "tool_call":
                 self._flush_turn()
@@ -136,8 +121,10 @@ class CallRecorder:
             if self.call.get("status") == "in_progress":
                 self.call["status"] = status
 
-            self.call["tokens"] = self._finalize_tokens()
-            self.call["gemini_cost_usd"] = pricing.compute_gemini_cost(self.call["tokens"])
+            usage = dict(self._usage)
+            usage["stt_seconds"] = round(usage.get("stt_seconds", 0.0), 3)
+            self.call["ai_usage"] = usage
+            self.call["ai_cost_usd"] = pricing.compute_ai_cost(usage)
             total, estimated = pricing.compute_total(self.call)
             self.call["total_cost_usd"] = total
             self.call["cost_estimated"] = estimated
@@ -145,7 +132,7 @@ class CallRecorder:
             await store.save_call(self.call)
             logger.info(
                 f"Call {self.call['id']} closed: {self.call['duration_seconds']}s, "
-                f"gemini=${self.call['gemini_cost_usd']:.6f}, total=${total:.6f}"
+                f"ai=${self.call['ai_cost_usd']:.6f}, total=${total:.6f}"
             )
 
             if self.call["source"] == "twilio" and not str(self.call["call_sid"]).startswith("web-"):
@@ -194,53 +181,11 @@ class CallRecorder:
             self.call["booking_created"] = True
 
     def _accumulate_usage(self, event):
-        snap = {
-            "total": int(event.get("total") or 0),
-            "thoughts": int(event.get("thoughts") or 0),
-            "in": {}, "out": {},
-        }
-        for mod, cnt in (event.get("prompt_by_modality") or []):
-            b = _in_bucket(mod)
-            snap["in"][b] = snap["in"].get(b, 0) + int(cnt or 0)
-        for mod, cnt in (event.get("response_by_modality") or []):
-            b = _out_bucket(mod)
-            snap["out"][b] = snap["out"].get(b, 0) + int(cnt or 0)
-        self._usage.append(snap)
-
-    def _finalize_tokens(self):
-        """
-        Reconcile per-event usage snapshots into final token buckets.
-
-        The Live API may report usage as per-turn increments OR as a running
-        session total. A cumulative series is strictly non-decreasing, so if the
-        `total` sequence never drops we take the LAST snapshot (the grand total);
-        otherwise we SUM the increments.
-        """
-        tokens = pricing._empty_tokens()
-        if not self._usage:
-            return tokens
-
-        totals = [e["total"] for e in self._usage]
-        non_decreasing = all(totals[i] <= totals[i + 1] for i in range(len(totals) - 1))
-        cumulative = non_decreasing and len(self._usage) > 1 and totals[-1] > 0
-
-        if cumulative:
-            chosen = [self._usage[-1]]
-        else:
-            chosen = self._usage
-
-        for snap in chosen:
-            for b, c in snap["in"].items():
-                tokens[b] += c
-            for b, c in snap["out"].items():
-                tokens[b] += c
-            tokens["thoughts"] += snap["thoughts"]
-
-        bucket_sum = (tokens["text_in"] + tokens["audio_in"] + tokens["imgvid_in"]
-                      + tokens["text_out"] + tokens["audio_out"] + tokens["thoughts"])
-        reported_total = totals[-1] if cumulative else sum(totals)
-        tokens["total"] = max(bucket_sum, reported_total)
-        return tokens
+        """Usage events carry incremental amounts — simple sums per stage."""
+        self._usage["stt_seconds"] += float(event.get("stt_seconds") or 0.0)
+        self._usage["llm_in"] += int(event.get("llm_in") or 0)
+        self._usage["llm_out"] += int(event.get("llm_out") or 0)
+        self._usage["tts_chars"] += int(event.get("tts_chars") or 0)
 
     async def _deferred_twilio_refresh(self, call_id, call_sid):
         """Fetch Twilio's real billed price after the call ends (price lags)."""

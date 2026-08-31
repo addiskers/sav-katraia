@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-google-genai
+httpx
 websockets
 python-dotenv
 python-multipart

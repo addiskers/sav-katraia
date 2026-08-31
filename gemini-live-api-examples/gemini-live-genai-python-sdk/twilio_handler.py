@@ -1,9 +1,9 @@
 """
-Twilio Voice <-> Gemini Live bridge.
+Twilio Voice <-> Sarvam voice agent bridge.
 
 Handles:
 - Twilio Media Streams WebSocket (mulaw 8kHz)
-- Audio conversion: mulaw 8kHz <-> PCM 16kHz (Gemini input) / PCM 24kHz (Gemini output)
+- Audio conversion: mulaw 8kHz <-> PCM 16kHz (STT input) / PCM 24kHz (TTS output)
 - Bridges the two in real-time
 - Pure Python audio conversion (no audioop, works on Python 3.13+)
 """
@@ -70,7 +70,7 @@ def _pcm16_to_mulaw_sample(sample: int) -> int:
 # ===== Audio conversion functions =====
 
 def mulaw_to_pcm16k(mulaw_bytes: bytes) -> bytes:
-    """Convert mulaw 8kHz (Twilio) -> PCM 16-bit 16kHz (Gemini input)."""
+    """Convert mulaw 8kHz (Twilio) -> PCM 16-bit 16kHz (STT input)."""
     # Decode mulaw to PCM16 at 8kHz
     samples_8k = [_MULAW_DECODE[b] for b in mulaw_bytes]
     # Upsample 8kHz -> 16kHz by linear interpolation
@@ -85,7 +85,7 @@ def mulaw_to_pcm16k(mulaw_bytes: bytes) -> bytes:
 
 
 def pcm24k_to_mulaw(pcm_bytes: bytes) -> bytes:
-    """Convert PCM 16-bit 24kHz (Gemini output) -> mulaw 8kHz (Twilio)."""
+    """Convert PCM 16-bit 24kHz (TTS output) -> mulaw 8kHz (Twilio)."""
     # Read PCM16 samples
     n_samples = len(pcm_bytes) // 2
     samples = struct.unpack(f"<{n_samples}h", pcm_bytes)
@@ -96,23 +96,23 @@ def pcm24k_to_mulaw(pcm_bytes: bytes) -> bytes:
 
 
 class TwilioMediaBridge:
-    """Bridges a Twilio Media Stream WebSocket with a Gemini Live session."""
+    """Bridges a Twilio Media Stream WebSocket with a Sarvam voice session."""
 
-    def __init__(self, websocket, gemini_client, text_trigger, on_event=None):
+    def __init__(self, websocket, agent_client, text_trigger, on_event=None):
         self.ws = websocket
-        self.gemini = gemini_client
+        self.agent = agent_client
         self.stream_sid = None
         self.call_sid = None
         self.text_trigger = text_trigger
         self.on_event = on_event  # async callback for live transcript
 
-        # Queues for Gemini
+        # Queues for the voice agent
         self.audio_input_queue = asyncio.Queue()
         self.video_input_queue = asyncio.Queue()
         self.text_input_queue = asyncio.Queue()
 
     async def audio_output_callback(self, data: bytes):
-        """Called when Gemini produces audio. Convert and send to Twilio."""
+        """Called when the agent produces audio. Convert and send to Twilio."""
         if not self.stream_sid:
             return
         try:
@@ -128,7 +128,7 @@ class TwilioMediaBridge:
             logger.error(f"Error sending audio to Twilio: {e}")
 
     async def audio_interrupt_callback(self):
-        """Called when Gemini detects user interruption. Clear Twilio buffer."""
+        """Called when the agent detects user interruption. Clear Twilio buffer."""
         if not self.stream_sid:
             return
         try:
@@ -181,13 +181,13 @@ class TwilioMediaBridge:
                 pass
 
     async def run(self):
-        """Run the bridge: Twilio <-> Gemini."""
+        """Run the bridge: Twilio <-> Sarvam agent."""
         twilio_task = asyncio.create_task(self.handle_twilio_messages())
 
         await self._emit({"type": "call_start", "call_sid": self.call_sid or ""})
 
         try:
-            async for event in self.gemini.start_session(
+            async for event in self.agent.start_session(
                 audio_input_queue=self.audio_input_queue,
                 video_input_queue=self.video_input_queue,
                 text_input_queue=self.text_input_queue,
@@ -198,11 +198,11 @@ class TwilioMediaBridge:
                     # Broadcast transcript/tool events to live watchers
                     await self._emit(event)
                     if event.get("type") == "error":
-                        logger.error(f"Gemini error during Twilio call: {event}")
+                        logger.error(f"Sarvam error during Twilio call: {event}")
                         break
         except Exception as e:
-            logger.error(f"Gemini session error: {e}")
+            logger.error(f"Sarvam session error: {e}")
         finally:
             await self._emit({"type": "call_end"})
             twilio_task.cancel()
-            logger.info("Twilio-Gemini bridge closed")
+            logger.info("Twilio-Sarvam bridge closed")

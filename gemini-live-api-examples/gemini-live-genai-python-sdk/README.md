@@ -1,88 +1,93 @@
-# Gemini Live API - Python SDK & Vanilla JS
+# Kataria Voice Agent — low-latency stack
 
-A demonstration of the Gemini Live API using the [Google Gen AI Python SDK](https://github.com/googleapis/python-genai) for the backend and vanilla JavaScript for the frontend. This example shows how to build a real-time multimodal application with a robust Python backend handling the API connection.
+A real-time voice service advisor ("Rahul" from Kataria Automobiles) with browser
+calls, Twilio phone calls, a live transcript dashboard, and an admin dashboard
+with real per-call costing. Built for **low latency** by picking the fastest
+provider for each stage.
+
+## Pipeline
+
+```
+caller audio (PCM16 16kHz)
+    │
+    ▼
+Deepgram nova-3 streaming STT ─ WebSocket, language=multi (Hindi/English/Gujarati),
+    │  final transcript      interim results + endpointing, barge-in
+    ▼
+Groq gpt-oss-20b chat completions ─ fast, native tool calling
+    │  reply text
+    ▼
+Sarvam Bulbul v3 TTS (speaker: rahul) ─ PCM16 24kHz back to the caller
+```
+
+Deepgram nova-3 (with `language=multi`) transcribes Hindi/English code-mixing, Groq
+replies fast, and Sarvam Bulbul keeps the natural Indian voice. Only TTS is on Sarvam.
+
+Notes:
+- Use **nova-3**, not nova-2 — nova-2 doesn't support `language=multi` and returns
+  nothing for Hindi.
+- Groq's free tier is **8,000 tokens/min per org**; the engine retries on 429 and the
+  system prompt is kept compact so multi-turn calls stay under the limit. For heavy
+  use, upgrade the Groq tier or point `GROQ_LLM_MODEL` at a larger model.
 
 ## Quick Start
 
 ### 1. Backend Setup
 
-Install dependencies and start the FastAPI server using `uv`:
-
 ```bash
 # Create a virtual environment and install dependencies
-uv venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\activate       # Windows   (macOS/Linux: source .venv/bin/activate)
+pip install -r requirements.txt
+
+# Configure
+copy .env.example .env       # then set SARVAM_API_KEY (get one at dashboard.sarvam.ai)
 
 # Start the server
-uv run main.py
+python main.py
 ```
 
 ### 2. Frontend
 
-Open your browser and navigate to:
+Open [http://localhost:8000](http://localhost:8000) and press Start Call.
 
-[http://localhost:8000](http://localhost:8000)
+- `/live` — real-time transcript of an in-progress phone call
+- `/admin` — call logs, transcripts and costing (key = `ANALYTICS_SECRET`)
 
-## Features
+## Costing — real measured usage (all USD)
 
-- **Google Gen AI SDK**: Uses the official Python SDK (`google-genai`) for simplified API interaction.
-- **FastAPI Backend**: Robust, async-ready web server handling WebSocket connections.
-- **Real-time Streaming**: Bi-directional audio and video streaming.
-- **Tool Use**: Demonstrates how to register and handle server-side tools.
-- **Vanilla JS Frontend**: Lightweight frontend with no build steps or framework dependencies.
+Every call records the actual usage of each stage and prices it (rates
+env-overridable in `.env`):
+
+| Stage | Provider | Measured | Rate |
+|---|---|---|---|
+| STT | Deepgram nova-3 | minutes of caller audio | ~$0.0077 / min |
+| LLM | Groq gpt-oss-20b | prompt + completion tokens | $0.15 in / $0.75 out per 1M |
+| TTS | Sarvam Bulbul v3 | characters synthesized | ₹30 / 10k chars (→ USD via `USD_INR`) |
+
+Twilio's real billed `Call.price` (USD) is fetched after each phone call and
+added to produce the combined USD total.
 
 ## Project Structure
 
 ```
 /
-├── main.py             # FastAPI server & WebSocket endpoint
-├── gemini_live.py      # Gemini Live API wrapper using Gen AI SDK
+├── main.py             # FastAPI server, WebSocket endpoints, dashboards
+├── voice_agent.py      # Deepgram STT → Groq LLM → Sarvam TTS engine
+├── twilio_handler.py   # Twilio Media Streams bridge (mulaw 8k <-> PCM)
+├── pricing.py          # Deepgram + Groq + Sarvam TTS rates + Twilio price
+├── recorder.py         # Per-call transcript + usage + cost recording
+├── store.py            # JSON call-record persistence + summaries
 ├── requirements.txt    # Python dependencies
 └── frontend/
-    ├── index.html      # User Interface
-    ├── main.js         # Application logic
-    ├── gemini-client.js # WebSocket client for backend communication
-    ├── media-handler.js # Audio/Video capture and playback
+    ├── index.html       # User Interface
+    ├── main.js          # Application logic
+    ├── sarvam-client.js # WebSocket client for backend communication
+    ├── media-handler.js # Audio capture and playback
     └── pcm-processor.js # AudioWorklet for PCM processing
 ```
 
 ## Configuration
 
-You can configure the application by setting environment variables or by using a `.env` file.
-
-**Important:** You must set the `GEMINI_API_KEY` to your Google AI Studio API key.
-
-1.  Create a `.env` file in the root directory.
-2.  Add your API key:
-
-```env
-GEMINI_API_KEY=your_api_key_here
-```
-
-Alternatively, you can set it in your shell:
-
-```bash
-export GEMINI_API_KEY=your_api_key_here
-```
-
-## Core Components
-
-### Backend (`gemini_live.py`)
-
-The `GeminiLive` class wraps the `genai.Client` to manage the session:
-
-```python
-# Connects using the SDK
-async with self.client.aio.live.connect(model=self.model, config=config) as session:
-    # Manages input/output queues
-    await asyncio.gather(
-        send_audio(),
-        send_video(),
-        receive_responses()
-    )
-```
-
-### Frontend (`gemini-client.js`)
-
-The frontend communicates with the FastAPI backend via WebSockets, sending base64-encoded media chunks and receiving audio responses.
+Set `DEEPGRAM_API_KEY`, `GROQ_API_KEY` and `SARVAM_API_KEY` in `.env` (see
+`.env.example` for every option: models, voice, Twilio credentials, cost rates).

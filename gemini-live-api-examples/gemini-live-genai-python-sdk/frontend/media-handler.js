@@ -51,8 +51,15 @@ class MediaHandler {
     await this.initializeAudio();
 
     try {
+      // Echo cancellation is essential: without it the mic picks up the
+      // agent's own TTS from the speakers and Deepgram transcribes it,
+      // causing false barge-ins and the agent "hearing itself".
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
       const source = this.audioContext.createMediaStreamSource(
         this.mediaStream

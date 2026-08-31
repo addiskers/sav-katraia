@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from gemini_live import GeminiLive
+from voice_agent import VoiceAgent
 from twilio_handler import TwilioMediaBridge
 
 import pricing
@@ -24,13 +24,12 @@ load_dotenv()
 
 # Configure logging - DEBUG for our modules, INFO for everything else
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("gemini_live").setLevel(logging.INFO)
+logging.getLogger("voice_agent").setLevel(logging.INFO)
 logging.getLogger(__name__).setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("MODEL", "gemini-3.1-flash-live-preview")
+MODEL = os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-120b")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+19785715824")
@@ -142,7 +141,7 @@ async def root():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for Gemini Live."""
+    """WebSocket endpoint for the voice agent."""
     await websocket.accept()
 
     logger.info("WebSocket connection accepted")
@@ -166,8 +165,7 @@ async def websocket_endpoint(websocket: WebSocket):
     async def audio_interrupt_callback():
         pass
 
-    gemini_client = GeminiLive(
-        api_key=GEMINI_API_KEY,
+    agent_client = VoiceAgent(
         model=MODEL,
         input_sample_rate=16000,
         tool_mapping={
@@ -196,6 +194,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             image_data = base64.b64decode(payload["data"])
                             await video_input_queue.put(image_data)
                             continue
+                        if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+                            text = payload["text"]
                     except json.JSONDecodeError:
                         pass
 
@@ -218,7 +218,7 @@ async def websocket_endpoint(websocket: WebSocket):
         for attempt in range(MAX_RETRIES + 1):
             should_retry = False
             try:
-                async for event in gemini_client.start_session(
+                async for event in agent_client.start_session(
                     audio_input_queue=audio_input_queue,
                     video_input_queue=video_input_queue,
                     text_input_queue=text_input_queue,
@@ -227,10 +227,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 ):
                     if event:
                         if event.get("type") == "error" and attempt < MAX_RETRIES:
-                            error_msg = event.get("error", "")
-                            if "exhausted" in error_msg or "quota" in error_msg.lower():
+                            error_msg = str(event.get("error", "")).lower()
+                            if "quota" in error_msg or "429" in error_msg or "rate" in error_msg:
                                 delay = RETRY_DELAYS[attempt]
-                                logger.warning(f"Quota error, retrying in {delay}s (attempt {attempt+1}/{MAX_RETRIES})")
+                                logger.warning(f"Rate/quota error, retrying in {delay}s (attempt {attempt+1}/{MAX_RETRIES})")
                                 try:
                                     await websocket.send_json({"type": "status", "text": "Reconnecting..."})
                                 except RuntimeError:
@@ -238,15 +238,6 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await asyncio.sleep(delay)
                                 should_retry = True
                                 break
-                        if event.get("type") == "go_away" and attempt < MAX_RETRIES:
-                            logger.info(f"GoAway received, reconnecting (attempt {attempt+1}/{MAX_RETRIES})")
-                            try:
-                                await websocket.send_json({"type": "status", "text": "Reconnecting..."})
-                            except RuntimeError:
-                                return
-                            await asyncio.sleep(1)
-                            should_retry = True
-                            break
                         await recorder.on_event(event)
                         try:
                             await websocket.send_json(event)
@@ -266,10 +257,10 @@ async def websocket_endpoint(websocket: WebSocket):
         session_task = asyncio.create_task(run_session_with_retry())
         await session_task
     except asyncio.CancelledError:
-        logger.info("Gemini session cancelled due to client disconnect")
+        logger.info("Voice agent session cancelled due to client disconnect")
     except Exception as e:
         import traceback
-        logger.error(f"Error in Gemini session: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        logger.error(f"Error in voice agent session: {type(e).__name__}: {e}\n{traceback.format_exc()}")
     finally:
         receive_task.cancel()
         await recorder.close()
@@ -307,8 +298,7 @@ async def twilio_media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio Media Stream WebSocket accepted")
 
-    gemini_client = GeminiLive(
-        api_key=GEMINI_API_KEY,
+    agent_client = VoiceAgent(
         model=MODEL,
         input_sample_rate=16000,
         tool_mapping={
@@ -342,7 +332,7 @@ async def twilio_media_stream(websocket: WebSocket):
 
     bridge = TwilioMediaBridge(
         websocket=websocket,
-        gemini_client=gemini_client,
+        agent_client=agent_client,
         text_trigger="Hi, I have picked up the phone. Please start the call.",
         on_event=broadcast_event,
     )
@@ -542,7 +532,7 @@ body::before {
   border: 1px solid rgba(0,212,255,0.15);
   border-bottom-right-radius: 4px;
 }
-.msg.gemini {
+.msg.agent {
   align-self: flex-start;
   background: linear-gradient(135deg, rgba(124,58,237,0.2), rgba(124,58,237,0.1));
   border: 1px solid rgba(124,58,237,0.15);
@@ -599,7 +589,7 @@ const waiting = document.getElementById('waiting');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 let currentUser = null;
-let currentGemini = null;
+let currentAgent = null;
 
 const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const ws = new WebSocket(protocol + '//' + location.host + '/live/ws');
@@ -616,34 +606,34 @@ ws.onmessage = (e) => {
     statusText.textContent = 'Call in progress';
     addSystem('Call started');
     currentUser = null;
-    currentGemini = null;
+    currentAgent = null;
   }
   else if (msg.type === 'call_end') {
     statusDot.className = 'dot';
     statusText.textContent = 'Call ended';
     addSystem('Call ended');
     currentUser = null;
-    currentGemini = null;
+    currentAgent = null;
   }
   else if (msg.type === 'user') {
     if (currentUser) {
       currentUser.querySelector('.text').textContent += msg.text;
     } else {
       currentUser = addMsg('user', msg.text);
-      currentGemini = null;
+      currentAgent = null;
     }
   }
-  else if (msg.type === 'gemini') {
-    if (currentGemini) {
-      currentGemini.querySelector('.text').textContent += msg.text;
+  else if (msg.type === 'agent') {
+    if (currentAgent) {
+      currentAgent.querySelector('.text').textContent += msg.text;
     } else {
-      currentGemini = addMsg('gemini', msg.text);
+      currentAgent = addMsg('agent', msg.text);
       currentUser = null;
     }
   }
   else if (msg.type === 'turn_complete') {
     currentUser = null;
-    currentGemini = null;
+    currentAgent = null;
   }
   else if (msg.type === 'tool_call') {
     addTool(msg.name, msg.result);
@@ -782,11 +772,11 @@ tbody tr:hover{background:rgba(0,212,255,0.05);}
 .x{cursor:pointer;color:var(--muted);font-size:1.3rem;line-height:1;background:none;border:none;}
 .cost-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px;}
 .cost-card{border:1px solid var(--border);border-radius:12px;padding:12px;}
-.cost-card.gem{border-color:rgba(124,58,237,.3);}
+.cost-card.ai{border-color:rgba(124,58,237,.3);}
 .cost-card.tw{border-color:rgba(0,212,255,.3);}
 .cost-card .ct{font-size:0.66rem;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:8px;}
 .cost-card .big{font-size:1.25rem;font-weight:800;font-family:var(--mono);}
-.cost-card.gem .big{color:var(--purple);}
+.cost-card.ai .big{color:var(--purple);}
 .cost-card.tw .big{color:var(--cyan);}
 .kv{display:flex;justify-content:space-between;font-size:0.7rem;color:var(--secondary);padding:3px 0;}
 .kv span:last-child{font-family:var(--mono);color:var(--text);}
@@ -794,7 +784,7 @@ tbody tr:hover{background:rgba(0,212,255,0.05);}
 .msg{padding:9px 13px;border-radius:12px;max-width:88%;font-size:0.82rem;line-height:1.5;margin-bottom:7px;animation:fadeIn .2s;}
 .msg .t{display:block;font-size:0.58rem;opacity:.5;font-family:var(--mono);margin-top:3px;}
 .msg.user{margin-left:auto;background:linear-gradient(135deg,rgba(0,212,255,.2),rgba(0,212,255,.08));border:1px solid rgba(0,212,255,.15);}
-.msg.gemini{background:linear-gradient(135deg,rgba(124,58,237,.2),rgba(124,58,237,.08));border:1px solid rgba(124,58,237,.15);}
+.msg.agent{background:linear-gradient(135deg,rgba(124,58,237,.2),rgba(124,58,237,.08));border:1px solid rgba(124,58,237,.15);}
 .tool{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:8px;padding:9px 12px;font-size:0.72rem;color:var(--green);margin-bottom:7px;}
 .tool b{font-weight:700;}
 .tool pre{margin-top:5px;color:var(--secondary);font-size:0.66rem;white-space:pre-wrap;word-break:break-word;}
@@ -840,7 +830,7 @@ tbody tr:hover{background:rgba(0,212,255,0.05);}
 
     <div class="section-title">Spend trend</div>
     <div class="row2">
-      <div class="panel" id="trend"><h3>Cost by day (Gemini + Twilio) &amp; call volume</h3><div id="trendBody"></div></div>
+      <div class="panel" id="trend"><h3>Cost by day (AI + Twilio) &amp; call volume</h3><div id="trendBody"></div></div>
       <div class="panel"><h3>Breakdown</h3><div id="breakdown"></div></div>
     </div>
 
@@ -862,7 +852,7 @@ tbody tr:hover{background:rgba(0,212,255,0.05);}
           <th data-k="language">Lang</th>
           <th data-k="status">Status</th>
           <th data-k="booking_created">Booking</th>
-          <th data-k="gemini_cost_usd" class="num">Gemini $</th>
+          <th data-k="ai_cost_usd" class="num">AI $</th>
           <th data-k="twilio" class="num">Twilio $</th>
           <th data-k="total_cost_usd" class="num">Total $</th>
         </tr></thead>
@@ -902,6 +892,8 @@ function logout(){localStorage.removeItem('admin_key');showDash(false);}
 /* ---------- formatting ---------- */
 const fmtUSD=(n)=>(n==null||isNaN(n))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:4}).format(n);
 const fmtUSD2=(n)=>(n==null||isNaN(n))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(n);
+const fmtINR=(n)=>(n==null||isNaN(n))?'—':new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:4}).format(n);
+const fmtINR2=(n)=>(n==null||isNaN(n))?'—':new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2}).format(n);
 const fmtNum=(n)=>(n==null||isNaN(n))?'—':new Intl.NumberFormat('en-US').format(n);
 const fmtPct=(x)=>(x==null||isNaN(x))?'—':(x*100).toFixed(1)+'%';
 function fmtDur(s){s=s||0;const m=Math.floor(s/60),r=Math.round(s%60);return m+':'+String(r).padStart(2,'0');}
@@ -937,7 +929,7 @@ function renderStats(){
   const cards=[
     {label:'Total calls',value:fmtNum(s.total_calls),sub:(s.by_source?Object.entries(s.by_source).map(([k,v])=>k+': '+v).join(' · '):'')},
     {label:'Total minutes',value:(s.total_minutes!=null?s.total_minutes.toFixed(1):'—')},
-    {label:'AI (Gemini) cost',value:fmtUSD(s.gemini_cost_usd),cls:'hi',sub:'real token usage'},
+    {label:'AI cost',value:fmtUSD(s.ai_cost_usd),cls:'hi',sub:'Deepgram + Groq + Sarvam'},
     {label:'Twilio cost',value:fmtUSD(s.twilio_cost_usd),cls:'cy'},
     {label:'Total real cost',value:fmtUSD(s.total_cost_usd),cls:'cy'},
     {label:'Avg cost / call',value:fmtUSD(s.avg_cost_per_call)},
@@ -985,10 +977,10 @@ function renderTrend(){
 /* ---------- render: breakdown ---------- */
 function renderBreakdown(){
   const s=state.summary||{};
-  const g=s.gemini_cost_usd||0,t=s.twilio_cost_usd||0,tot=(g+t)||1;
+  const g=s.ai_cost_usd||0,t=s.twilio_cost_usd||0,tot=(g+t)||1;
   const langs=s.by_language||{};
   let html='';
-  html+=brkRow('Gemini (AI)',fmtUSD(g),g/tot,'#7c3aed');
+  html+=brkRow('AI (STT+LLM+TTS)',fmtUSD(g),g/tot,'#7c3aed');
   html+=brkRow('Twilio (telephony)',fmtUSD(t),t/tot,'#00d4ff');
   html+='<div class="sub-h" style="margin:14px 0 6px;">By language</div>';
   const le=Object.entries(langs).sort((a,b)=>b[1]-a[1]);
@@ -1027,7 +1019,7 @@ function renderRows(){
       '<td>'+esc(c.language||'—')+'</td>'+
       '<td><span class="pill '+esc(c.status||'')+'">'+esc(c.status||'')+'</span></td>'+
       '<td>'+(c.booking_created?'<span class="tick">✓</span>':'<span class="dash">—</span>')+'</td>'+
-      '<td class="num">'+fmtUSD(c.gemini_cost_usd)+'</td>'+
+      '<td class="num">'+fmtUSD(c.ai_cost_usd)+'</td>'+
       '<td class="num">'+(tw==null?'<span class="dash">—</span>':fmtUSD(tw))+'</td>'+
       '<td class="num">'+fmtUSD(c.total_cost_usd)+est+'</td>'+
     '</tr>';
@@ -1049,24 +1041,22 @@ async function openDrawer(id){
 }
 function closeDrawer(){const d=$('drawer'),b=$('backdrop');if(d)d.remove();if(b)b.remove();}
 function renderDrawer(c){
-  const cb=c.cost_breakdown||{},gem=cb.gemini||{},tk=gem.tokens||{},tw=cb.twilio||{};
+  const cb=c.cost_breakdown||{},sv=cb.ai||{},us=sv.usage||{},st=sv.cost_by_stage_usd||{},tw=cb.twilio||{};
   const tcalls=(c.tool_calls||[]).map(t=>
     '<div class="tool"><b>'+esc(t.name)+'</b><pre>'+esc(JSON.stringify(t.result,null,2)||'').slice(0,600)+'</pre></div>').join('')||'<div class="kv"><span>No tool calls</span><span></span></div>';
   const tr=(c.transcript||[]).map(m=>
-    '<div class="msg '+(m.role==='user'?'user':'gemini')+'"><span>'+esc(m.text)+'</span><span class="t">'+esc((m.role||'').toUpperCase())+'</span></div>').join('')||'<div class="empty">No transcript captured</div>';
+    '<div class="msg '+(m.role==='user'?'user':'agent')+'"><span>'+esc(m.text)+'</span><span class="t">'+esc((m.role||'').toUpperCase())+'</span></div>').join('')||'<div class="empty">No transcript captured</div>';
   $('drawer').innerHTML=
     '<div class="dh"><div><div class="who">'+esc(c.caller||(c.source==='browser'?'Web visitor':c.call_sid||'Call'))+'</div>'+
       '<div class="meta">'+esc(c.source)+' · '+fmtDT(c.started_at)+' · '+fmtDur(c.duration_seconds)+' · '+esc(c.status||'')+'</div></div>'+
       '<button class="x" onclick="closeDrawer()">×</button></div>'+
     '<div class="dbody">'+
       '<div class="cost-grid">'+
-        '<div class="cost-card gem"><div class="ct">Gemini (AI) cost</div><div class="big">'+fmtUSD(gem.cost_usd)+'</div>'+
-          '<div class="kv"><span>Audio in</span><span>'+fmtNum(tk.audio_in)+'</span></div>'+
-          '<div class="kv"><span>Audio out</span><span>'+fmtNum(tk.audio_out)+'</span></div>'+
-          '<div class="kv"><span>Text in</span><span>'+fmtNum(tk.text_in)+'</span></div>'+
-          '<div class="kv"><span>Text out</span><span>'+fmtNum(tk.text_out)+'</span></div>'+
-          '<div class="kv"><span>Thinking</span><span>'+fmtNum(tk.thoughts)+'</span></div>'+
-          '<div class="kv"><span>Total tokens</span><span>'+fmtNum(tk.total)+'</span></div>'+
+        '<div class="cost-card ai"><div class="ct">AI cost (STT + LLM + TTS)</div><div class="big">'+fmtUSD(sv.cost_usd)+'</div>'+
+          '<div class="kv"><span>STT (Deepgram)</span><span>'+((us.stt_seconds!=null)?us.stt_seconds.toFixed(1)+'s · '+fmtUSD(st.stt):'—')+'</span></div>'+
+          '<div class="kv"><span>LLM in (Groq)</span><span>'+fmtNum(us.llm_in)+' · '+fmtUSD(st.llm_in)+'</span></div>'+
+          '<div class="kv"><span>LLM out (Groq)</span><span>'+fmtNum(us.llm_out)+' · '+fmtUSD(st.llm_out)+'</span></div>'+
+          '<div class="kv"><span>TTS chars (Sarvam)</span><span>'+fmtNum(us.tts_chars)+' · '+fmtUSD(st.tts)+'</span></div>'+
         '</div>'+
         '<div class="cost-card tw"><div class="ct">Twilio cost</div><div class="big">'+(tw.price_usd==null?'—':fmtUSD(tw.price_usd))+'</div>'+
           '<div class="kv"><span>Duration</span><span>'+fmtDur(tw.duration_seconds)+'</span></div>'+
@@ -1098,10 +1088,10 @@ async function exportCall(id){
 function dl(blob,name){const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download=name;a.click();URL.revokeObjectURL(u);}
 function exportCSV(){
   const rows=state.calls;
-  const cols=['started_at','call_sid','source','caller','duration_seconds','language','status','booking_created','gemini_cost_usd','twilio_price_usd','total_cost_usd'];
+  const cols=['started_at','call_sid','source','caller','duration_seconds','language','status','booking_created','ai_cost_usd','twilio_price_usd','total_cost_usd'];
   const lines=[cols.join(',')];
   rows.forEach(c=>{
-    const v=[c.started_at,c.call_sid,c.source,c.caller,c.duration_seconds,c.language,c.status,c.booking_created,c.gemini_cost_usd,(c.twilio||{}).price_usd,c.total_cost_usd];
+    const v=[c.started_at,c.call_sid,c.source,c.caller,c.duration_seconds,c.language,c.status,c.booking_created,c.ai_cost_usd,(c.twilio||{}).price_usd,c.total_cost_usd];
     lines.push(v.map(x=>{x=x==null?'':String(x);return /[",\\n]/.test(x)?'"'+x.replace(/"/g,'""')+'"':x;}).join(','));
   });
   dl(new Blob([lines.join('\\n')],{type:'text/csv'}),'call_logs.csv');
@@ -1221,7 +1211,7 @@ async def admin_calls_csv(request: Request):
     data = await store.list_calls(filters)
     buf = io.StringIO()
     cols = ["started_at", "call_sid", "source", "caller", "duration_seconds",
-            "language", "status", "booking_created", "gemini_cost_usd",
+            "language", "status", "booking_created", "ai_cost_usd",
             "twilio_price_usd", "total_cost_usd", "cost_estimated"]
     writer = csv.writer(buf)
     writer.writerow(cols)
@@ -1229,7 +1219,7 @@ async def admin_calls_csv(request: Request):
         writer.writerow([
             c.get("started_at"), c.get("call_sid"), c.get("source"), c.get("caller"),
             c.get("duration_seconds"), c.get("language"), c.get("status"),
-            c.get("booking_created"), c.get("gemini_cost_usd"),
+            c.get("booking_created"), c.get("ai_cost_usd"),
             (c.get("twilio") or {}).get("price_usd"), c.get("total_cost_usd"),
             c.get("cost_estimated"),
         ])
@@ -1245,7 +1235,7 @@ async def admin_call_detail(call_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Call not found")
     tw = call.get("twilio") or {}
     call["cost_breakdown"] = {
-        "gemini": pricing.gemini_cost_breakdown(call.get("tokens")),
+        "ai": pricing.ai_cost_breakdown(call.get("ai_usage")),
         "twilio": {
             "duration_seconds": tw.get("duration_seconds") or call.get("duration_seconds"),
             "price_usd": tw.get("price_usd"),

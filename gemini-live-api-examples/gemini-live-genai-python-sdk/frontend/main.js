@@ -19,7 +19,7 @@ const chatLog = document.getElementById("chat-log");
 const callTimerEl = document.getElementById("call-timer");
 const languageIndicator = document.getElementById("language-indicator");
 
-let currentGeminiMessageDiv = null;
+let currentAgentMessageDiv = null;
 let currentUserMessageDiv = null;
 
 // New state
@@ -32,11 +32,11 @@ let serviceCostData = null;
 let audioVisualizerAnimationId = null;
 
 // Call transcript & outcome tracking
-let callTranscript = []; // {role: "user"|"gemini", text: "", time: ""}
+let callTranscript = []; // {role: "user"|"agent", text: "", time: ""}
 let toolCallsLog = [];   // {name, args, result}
 
 const mediaHandler = new MediaHandler();
-const geminiClient = new GeminiClient({
+const sarvamClient = new SarvamClient({
   onOpen: () => {
     setStatus("connected", "Connected");
     authSection.classList.add("hidden");
@@ -45,7 +45,7 @@ const geminiClient = new GeminiClient({
     startCallTimer();
 
     // Send initial trigger to force agent to start talking
-    geminiClient.sendText(
+    sarvamClient.sendText(
       `Hi, I have picked up the phone. Please start the call.`
     );
 
@@ -165,7 +165,7 @@ function initAudioVisualizer() {
       ctx.stroke();
     }
 
-    // Output (Gemini speaking) — frequency bars
+    // Output (agent speaking) — frequency bars
     const outputAnalyser = mediaHandler.getOutputAnalyser();
     if (outputAnalyser) {
       const bufferLength = outputAnalyser.frequencyBinCount;
@@ -306,10 +306,10 @@ function handleJsonMessage(msg) {
     return;
   } else if (msg.type === "interrupted") {
     mediaHandler.stopAudioPlayback();
-    currentGeminiMessageDiv = null;
+    currentAgentMessageDiv = null;
     currentUserMessageDiv = null;
   } else if (msg.type === "turn_complete") {
-    currentGeminiMessageDiv = null;
+    currentAgentMessageDiv = null;
     currentUserMessageDiv = null;
   } else if (msg.type === "user") {
     if (currentUserMessageDiv) {
@@ -324,17 +324,17 @@ function handleJsonMessage(msg) {
       currentUserMessageDiv = appendMessage("user", msg.text);
       callTranscript.push({ role: "user", text: msg.text, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
     }
-  } else if (msg.type === "gemini") {
-    if (currentGeminiMessageDiv) {
-      const textEl = currentGeminiMessageDiv.querySelector(".msg-text");
+  } else if (msg.type === "agent") {
+    if (currentAgentMessageDiv) {
+      const textEl = currentAgentMessageDiv.querySelector(".msg-text");
       if (textEl) textEl.textContent += msg.text;
-      if (callTranscript.length && callTranscript[callTranscript.length - 1].role === "gemini") {
+      if (callTranscript.length && callTranscript[callTranscript.length - 1].role === "agent") {
         callTranscript[callTranscript.length - 1].text += msg.text;
       }
       chatLog.scrollTop = chatLog.scrollHeight;
     } else {
-      currentGeminiMessageDiv = appendMessage("gemini", msg.text);
-      callTranscript.push({ role: "gemini", text: msg.text, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
+      currentAgentMessageDiv = appendMessage("agent", msg.text);
+      callTranscript.push({ role: "agent", text: msg.text, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
     }
     detectLanguage(msg.text);
   } else if (msg.type === "tool_call") {
@@ -429,7 +429,7 @@ connectBtn.onclick = async () => {
 
   try {
     await mediaHandler.initializeAudio();
-    geminiClient.connect();
+    sarvamClient.connect();
   } catch (error) {
     console.error("Connection error:", error);
     setStatus("error", "Failed: " + error.message);
@@ -441,8 +441,8 @@ connectBtn.onclick = async () => {
 async function startMic() {
   try {
     await mediaHandler.startAudio((data) => {
-      if (geminiClient.isConnected()) {
-        geminiClient.send(data);
+      if (sarvamClient.isConnected()) {
+        sarvamClient.send(data);
       }
     });
     micBtn.classList.add("active");
@@ -482,8 +482,8 @@ cameraBtn.onclick = async () => {
     }
     try {
       await mediaHandler.startVideo(videoPreview, (base64Data) => {
-        if (geminiClient.isConnected()) {
-          geminiClient.sendImage(base64Data);
+        if (sarvamClient.isConnected()) {
+          sarvamClient.sendImage(base64Data);
         }
       });
       cameraBtn.classList.add("active");
@@ -514,8 +514,8 @@ screenBtn.onclick = async () => {
       await mediaHandler.startScreen(
         videoPreview,
         (base64Data) => {
-          if (geminiClient.isConnected()) {
-            geminiClient.sendImage(base64Data);
+          if (sarvamClient.isConnected()) {
+            sarvamClient.sendImage(base64Data);
           }
         },
         () => {
@@ -541,8 +541,8 @@ textInput.onkeypress = (e) => {
 
 function sendText() {
   const text = textInput.value;
-  if (text && geminiClient.isConnected()) {
-    geminiClient.sendText(text);
+  if (text && sarvamClient.isConnected()) {
+    sarvamClient.sendText(text);
     appendMessage("user", text);
     textInput.value = "";
   }
@@ -550,7 +550,7 @@ function sendText() {
 
 // --- Disconnect ---
 disconnectBtn.onclick = () => {
-  geminiClient.disconnect();
+  sarvamClient.disconnect();
 };
 
 // --- Session End ---
@@ -632,7 +632,7 @@ function showSessionEnd() {
       <div class="transcript-full">`;
     for (const entry of callTranscript) {
       const roleLabel = entry.role === "user" ? "Customer" : "Advisor";
-      const roleClass = entry.role === "user" ? "tr-user" : "tr-gemini";
+      const roleClass = entry.role === "user" ? "tr-user" : "tr-agent";
       html += `<div class="tr-line ${roleClass}">
         <span class="tr-time">${entry.time}</span>
         <span class="tr-role">${roleLabel}:</span>
@@ -681,7 +681,7 @@ function resetUI() {
   vehicleData = null;
   bookingData = null;
   serviceCostData = null;
-  currentGeminiMessageDiv = null;
+  currentAgentMessageDiv = null;
   currentUserMessageDiv = null;
   callTranscript = [];
   toolCallsLog = [];

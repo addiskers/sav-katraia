@@ -1,0 +1,23 @@
+[Unit]
+Description=Kataria Voice Agent (Deepgram + Groq + Sarvam)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+# Adjust APP_DIR if you clone somewhere else.
+Environment=APP_DIR=/opt/voice-agent/gemini-live-api-examples/gemini-live-genai-python-sdk
+WorkingDirectory=/opt/voice-agent/gemini-live-api-examples/gemini-live-genai-python-sdk
+# The app reads secrets from this file (never commit it — see .env.example).
+EnvironmentFile=/opt/voice-agent/gemini-live-api-examples/gemini-live-genai-python-sdk/.env
+# Bind to localhost only; nginx terminates TLS and proxies to it.
+Environment=PORT=8000
+ExecStart=/opt/voice-agent/gemini-live-api-examples/gemini-live-genai-python-sdk/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=3
+# Persist call-log JSON store across restarts.
+Environment=DATA_DIR=/var/lib/voice-agent/data
+
+[Install]
+WantedBy=multi-user.target

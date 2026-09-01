@@ -1047,12 +1047,15 @@ class VoiceAgent:
                 await asyncio.sleep(0)  # yield so a cancel can land between chunks
 
         async def speak_stream(sentence_queue, lang):
-            """Stream text into Sarvam TTS WebSocket; play PCM as it arrives.
-
-            Reuses the session WebSocket (R&D: ~40-50ms faster than reconnect).
-            """
+            """Stream text into Sarvam TTS WebSocket; play PCM as it arrives."""
             chars_sent = 0
             sender_done = asyncio.Event()
+            sender_done_at = {"t": None}
+            last_audio_at = {"t": 0.0}
+            got_audio = {"v": False}
+            flush_timeout = float(os.getenv("TTS_FLUSH_TIMEOUT_S", "12"))
+            idle_after_flush = float(os.getenv("TTS_IDLE_AFTER_FLUSH_S", "0.8"))
+
             try:
                 async with tts_lock:
                     ws = await _ensure_tts(lang)
@@ -1064,6 +1067,7 @@ class VoiceAgent:
                             if sentence is None:
                                 await ws.send(json.dumps({"type": "flush"}))
                                 sender_done.set()
+                                sender_done_at["t"] = time.monotonic()
                                 return
                             if not sentence.strip():
                                 continue
@@ -1075,7 +1079,30 @@ class VoiceAgent:
 
                     send_task = asyncio.create_task(sender())
                     try:
-                        async for raw in ws:
+                        while True:
+                            if sender_done.is_set() and sender_done_at["t"]:
+                                elapsed = time.monotonic() - sender_done_at["t"]
+                                if got_audio["v"]:
+                                    if (time.monotonic() - last_audio_at["t"]
+                                            >= idle_after_flush):
+                                        break
+                                elif elapsed >= 1.5:
+                                    logger.warning(
+                                        "Sarvam TTS: no audio after flush")
+                                    break
+                                if elapsed >= flush_timeout:
+                                    logger.warning(
+                                        "Sarvam TTS flush timeout")
+                                    break
+                            try:
+                                wait = (idle_after_flush if sender_done.is_set()
+                                        else flush_timeout)
+                                raw = await asyncio.wait_for(ws.recv(), timeout=wait)
+                            except asyncio.TimeoutError:
+                                if sender_done.is_set():
+                                    break
+                                logger.warning("Sarvam TTS waiting for first audio")
+                                continue
                             if isinstance(raw, bytes):
                                 continue
                             msg = json.loads(raw)
@@ -1084,13 +1111,14 @@ class VoiceAgent:
                                 audio_b64 = (msg.get("data") or {}).get("audio")
                                 if not audio_b64:
                                     continue
-                                pcm = _strip_wav_header(base64.b64decode(audio_b64))
+                                pcm = _strip_wav_header(
+                                    base64.b64decode(audio_b64))
                                 if pcm:
+                                    got_audio["v"] = True
+                                    last_audio_at["t"] = time.monotonic()
                                     await _emit_audio(pcm)
                             elif mtype == "event":
                                 et = (msg.get("data") or {}).get("event_type")
-                                # Sarvam emits `final` after EACH text chunk.
-                                # Only exit after flush + final, or all audio is lost.
                                 if et == "final" and sender_done.is_set():
                                     break
                             elif mtype == "error":
@@ -1249,7 +1277,13 @@ class VoiceAgent:
 
                 await emit({"type": "agent", "text": full})
                 recent_agent["text"] = full[-500:]
-                await speak_text(full, lang="hi-IN")
+                logger.info("Greeting: starting TTS")
+                try:
+                    await speak_text(full, lang="hi-IN")
+                    logger.info("Greeting: TTS complete")
+                except Exception as e:
+                    logger.error(f"Greeting TTS failed: {e}")
+                    await emit({"type": "error", "error": f"TTS failed: {e}"})
                 greeted["done"] = True
                 barge_in_ok["v"] = True
                 await emit({"type": "turn_complete"})

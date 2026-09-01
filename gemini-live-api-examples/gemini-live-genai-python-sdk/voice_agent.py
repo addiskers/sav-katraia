@@ -92,10 +92,10 @@ def get_system_instruction():
     return (
         f"You are Rahul (ONLY Rahul) at Kataria Automobiles (spell Kataria, never Katrina), "
         f"Maruti Suzuki dealership, Ahmedabad. LIVE phone call — words are spoken aloud.\n"
-        f"OUTPUT: plain speech only (no markdown/bullets/emoji). Native script "
+        f"OUTPUT: plain speech only (no markdown/bullets/emoji/parentheses). Native script "
         f"(Hindi/Marathi Devanagari, Gujarati script, English Latin). Never romanize "
         f"Indian languages. 1–2 short sentences per turn; one step then wait. Never "
-        f"narrate reasoning; if on hold stay silent.\n"
+        f"narrate reasoning or stage directions; if on hold stay silent.\n"
         f"DATES: Today {today.strftime('%Y-%m-%d')} ({today.strftime('%A')}); "
         f"kal/tomorrow={tomorrow.strftime('%Y-%m-%d')}; "
         f"parso/day-after={day_after.strftime('%Y-%m-%d')}. Pickup dates are near-future "
@@ -104,6 +104,8 @@ def get_system_instruction():
         f"language (en/gu/mr/hi) and stay. Never mix.\n"
         f"ACK: if customer only acknowledges (short yes/ok/go ahead), proceed directly to "
         f"step 2 (vehicle+service+pickup); do not ask which language they prefer.\n"
+        f"LISTEN: if customer says suno/suniye/listen or sounds frustrated, stop repeating, "
+        f"apologize briefly, ask what they need — never ask the same question twice in a row.\n"
         f"FLOW (wait after each): (1) name vehicle+service due (2) offer free pickup/drop "
         f"(3) confirm address (4) ask day/time (5) MUST call schedule_pickup when all "
         f"confirmed (6) share booking ID/driver (7) warm close. Call get_vehicle_info at "
@@ -308,6 +310,14 @@ def _allows_barge_in(text: str) -> bool:
     return ok
 
 
+def _sanitize_speech(text: str) -> str:
+    """Strip parenthetical stage directions the LLM sometimes emits."""
+    if not text:
+        return text
+    cleaned = re.sub(r"\([^)]*\)", "", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _resolve_llm_config():
     """Prefer OpenRouter (LLM_*/OPENROUTER_*); fall back to Groq as a set.
 
@@ -410,6 +420,7 @@ class VoiceAgent:
 
         speaking = {"on": False}       # agent audio is being sent out right now
         speaking_since = {"t": 0.0}    # monotonic time when current audio began
+        agent_busy = {"v": False}      # LLM+TTS turn in flight (broader than speaking)
         current_turn = {"task": None}  # in-flight agent turn task
         greeted = {"done": False}
         customer_lang = {"v": None, "hint_sent": False}
@@ -417,7 +428,7 @@ class VoiceAgent:
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
         barge_in_ok = {"v": False}
-        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "1.25"))
+        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.5"))
 
 
         async def emit(event):
@@ -425,22 +436,23 @@ class VoiceAgent:
 
         # ---- barge-in -------------------------------------------------------
         async def interrupt_agent(reason="speech"):
-            if not barge_in_ok["v"] or not speaking["on"]:
-                return
-            # Mic often picks up the agent's own TTS → false barge-in.
-            # Ignore interruptions for a short grace window after audio starts.
-            if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
+            if not barge_in_ok["v"]:
                 return
             task = current_turn["task"]
-            if task and not task.done():
-                logger.info(f"Barge-in ({reason})")
-                task.cancel()
-                if audio_interrupt_callback:
-                    if inspect.iscoroutinefunction(audio_interrupt_callback):
-                        await audio_interrupt_callback()
-                    else:
-                        audio_interrupt_callback()
-                await emit({"type": "interrupted"})
+            if not task or task.done() or not agent_busy["v"]:
+                return
+            # Echo guard applies only while TTS audio is actively playing.
+            if speaking["on"]:
+                if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
+                    return
+            logger.info(f"Barge-in ({reason})")
+            task.cancel()
+            if audio_interrupt_callback:
+                if inspect.iscoroutinefunction(audio_interrupt_callback):
+                    await audio_interrupt_callback()
+                else:
+                    audio_interrupt_callback()
+            await emit({"type": "interrupted"})
 
         # ---- Deepgram STT: stream caller audio, receive transcripts ---------
         async def stt_loop():
@@ -501,9 +513,10 @@ class VoiceAgent:
                                 mtype = msg.get("type")
 
                                 if mtype == "SpeechStarted":
-                                    # Do not barge-in on VAD alone — minor bg noise
-                                    # was stopping the agent mid-sentence.
-                                    pass
+                                    # Fast barge-in while agent TTS is playing
+                                    # (not during LLM-only phase — avoids noise false triggers).
+                                    if speaking["on"]:
+                                        await interrupt_agent("SpeechStarted")
                                 elif mtype == "Results":
                                     alt = (((msg.get("channel") or {}).get("alternatives")
                                             or [{}])[0])
@@ -883,6 +896,9 @@ class VoiceAgent:
             if not text or not text.strip():
                 return
             lang = lang or _tts_language_for(text)
+            text = _sanitize_speech(text)
+            if not text:
+                return
             sentence_queue = asyncio.Queue()
             speak_task = asyncio.create_task(speak_stream(sentence_queue, lang))
             for chunk in _split_sentences(text):
@@ -949,6 +965,7 @@ class VoiceAgent:
             # cancel this before any audio played (logs: "interrupted by caller").
             barge_in_ok["v"] = False
             speaking["on"] = False
+            agent_busy["v"] = True
             try:
                 if vehicle_prefetch["done"] and vehicle_prefetch["data"] is not None:
                     vehicle = vehicle_prefetch["data"]
@@ -1008,90 +1025,98 @@ class VoiceAgent:
             except Exception:
                 speaking["on"] = False
                 raise
+            finally:
+                agent_busy["v"] = False
 
         # ---- one agent turn: LLM (+tools) then TTS, all streamed ------------
         async def run_turn(user_text):
             barge_in_ok["v"] = True
-            if customer_lang["v"] and not customer_lang["hint_sent"]:
-                lang_labels = {
-                    "hi-IN": "Hindi (Devanagari script)",
-                    "gu-IN": "Gujarati script",
-                    "en-IN": "English",
-                }
-                label = lang_labels.get(customer_lang["v"], customer_lang["v"])
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"Customer language is {label}. Reply ONLY in that "
-                        f"language/script for the rest of this call. Never mix."
-                    ),
-                })
-                customer_lang["hint_sent"] = True
-
-            messages.append({"role": "user", "content": user_text})
-            turn_tts_lang = customer_lang["v"]
-            for _ in range(5):  # tool-call loop guard
-                sentence_queue = asyncio.Queue()
-                agent_text_parts = []
-                started_speaking = {"v": False}
-                speak_task = None
-                speak_lang = {"v": turn_tts_lang}
-
-                async def on_sentence(s):
-                    nonlocal speak_task
-                    if not started_speaking["v"]:
-                        started_speaking["v"] = True
-                        if not speak_lang["v"]:
-                            speak_lang["v"] = _tts_language_for(s)
-                        # speaking["on"] flips true inside _emit_audio (first PCM)
-                        speak_task = asyncio.create_task(
-                            speak_stream(sentence_queue, speak_lang["v"]))
-                    agent_text_parts.append(s)
-                    await emit({"type": "agent", "text": s})
-                    await sentence_queue.put(s)
-
-                try:
-                    reply = await chat_completion_stream(messages, on_sentence)
-                finally:
-                    if started_speaking["v"]:
-                        await sentence_queue.put(None)  # end the audio stream
-                        if speak_task:
-                            try:
-                                await speak_task
-                            finally:
-                                speaking["on"] = False
-                    else:
-                        speaking["on"] = False
-
-                tool_calls = reply.get("tool_calls") or []
-                if tool_calls:
+            agent_busy["v"] = True
+            try:
+                if customer_lang["v"] and not customer_lang["hint_sent"]:
+                    lang_labels = {
+                        "hi-IN": "Hindi (Devanagari script)",
+                        "gu-IN": "Gujarati script",
+                        "en-IN": "English",
+                    }
+                    label = lang_labels.get(customer_lang["v"], customer_lang["v"])
                     messages.append({
-                        "role": "assistant",
-                        "content": reply.get("content") or "",
-                        "tool_calls": tool_calls,
+                        "role": "system",
+                        "content": (
+                            f"Customer language is {label}. Reply ONLY in that "
+                            f"language/script for the rest of this call. Never mix."
+                        ),
                     })
-                    for tc in tool_calls:
-                        fn = (tc.get("function") or {})
-                        name = fn.get("name") or ""
-                        try:
-                            args = json.loads(fn.get("arguments") or "{}")
-                        except json.JSONDecodeError:
-                            args = {}
-                        result = await run_tool(name, args)
-                        await emit({"type": "tool_call", "name": name,
-                                    "args": args, "result": result})
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.get("id") or name,
-                            "content": json.dumps(result, ensure_ascii=False, default=str),
-                        })
-                    continue  # loop again for the model's spoken answer
+                    customer_lang["hint_sent"] = True
 
-                content = "".join(agent_text_parts).strip()
-                if content:
-                    messages.append({"role": "assistant", "content": content})
-                await emit({"type": "turn_complete"})
-                return
+                messages.append({"role": "user", "content": user_text})
+                turn_tts_lang = customer_lang["v"]
+                for _ in range(5):  # tool-call loop guard
+                    sentence_queue = asyncio.Queue()
+                    agent_text_parts = []
+                    started_speaking = {"v": False}
+                    speak_task = None
+                    speak_lang = {"v": turn_tts_lang}
+
+                    async def on_sentence(s):
+                        nonlocal speak_task
+                        s = _sanitize_speech(s)
+                        if not s:
+                            return
+                        if not started_speaking["v"]:
+                            started_speaking["v"] = True
+                            if not speak_lang["v"]:
+                                speak_lang["v"] = _tts_language_for(s)
+                            speak_task = asyncio.create_task(
+                                speak_stream(sentence_queue, speak_lang["v"]))
+                        agent_text_parts.append(s)
+                        await emit({"type": "agent", "text": s})
+                        await sentence_queue.put(s)
+
+                    try:
+                        reply = await chat_completion_stream(messages, on_sentence)
+                    finally:
+                        if started_speaking["v"]:
+                            await sentence_queue.put(None)
+                            if speak_task:
+                                try:
+                                    await speak_task
+                                finally:
+                                    speaking["on"] = False
+                        else:
+                            speaking["on"] = False
+
+                    tool_calls = reply.get("tool_calls") or []
+                    if tool_calls:
+                        messages.append({
+                            "role": "assistant",
+                            "content": reply.get("content") or "",
+                            "tool_calls": tool_calls,
+                        })
+                        for tc in tool_calls:
+                            fn = (tc.get("function") or {})
+                            name = fn.get("name") or ""
+                            try:
+                                args = json.loads(fn.get("arguments") or "{}")
+                            except json.JSONDecodeError:
+                                args = {}
+                            result = await run_tool(name, args)
+                            await emit({"type": "tool_call", "name": name,
+                                        "args": args, "result": result})
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.get("id") or name,
+                                "content": json.dumps(result, ensure_ascii=False, default=str),
+                            })
+                        continue
+
+                    content = _sanitize_speech("".join(agent_text_parts).strip())
+                    if content:
+                        messages.append({"role": "assistant", "content": content})
+                    await emit({"type": "turn_complete"})
+                    return
+            finally:
+                agent_busy["v"] = False
 
         async def agent_loop():
             while True:

@@ -1,19 +1,19 @@
 """
 Low-latency voice agent engine.
 
-  caller audio (PCM16 16kHz) --> Deepgram nova-2 streaming STT (WebSocket)
+  caller audio (PCM16 16kHz) --> Deepgram nova-3 streaming STT (WebSocket)
                                        |
                                  final transcript
                                        |
-                       Groq Llama-3.3-70B chat completions (tool calling)
+              OpenRouter -> Cerebras gpt-oss-120b chat completions (tool calling)
                                        |
                                  reply text
                                        |
-                  Sarvam Bulbul TTS (REST) --> PCM16 24kHz --> caller
+           Sarvam Bulbul TTS (WebSocket stream) --> PCM16 24kHz --> caller
 
-Deepgram gives sub-200ms interim transcripts + endpointing, Groq serves Llama
-at ~300 tok/s so replies start almost instantly, and Sarvam Bulbul keeps the
-natural Indian "rahul" voice. Only TTS stays on Sarvam.
+Deepgram gives sub-200ms interim transcripts + endpointing, Cerebras serves
+gpt-oss-120b at ~3000 tok/s with prompt caching, and Sarvam Bulbul WebSocket
+streaming starts audio mid-generation. Only TTS stays on Sarvam.
 
 Exposes the SAME session interface the rest of the app already uses
 (`start_session(...)` async generator yielding event dicts), so the Twilio
@@ -27,7 +27,7 @@ Emitted events:
   {"type": "interrupted"}                user barged in while agent spoke
   {"type": "usage", ...}                 real usage for costing:
         stt_seconds  - seconds of caller audio streamed to Deepgram
-        llm_in / llm_out - Groq chat completion tokens
+        llm_in / llm_out - chat completion tokens
         tts_chars    - characters synthesized by Bulbul
   {"type": "error", "error": ...}
 """
@@ -49,94 +49,63 @@ import websockets
 logger = logging.getLogger(__name__)
 
 # ---- Providers -------------------------------------------------------------
-# NOTE: API keys are read at session START (see start_session), not import time,
-# because main.py imports this module before it calls load_dotenv().
-GROQ_CHAT_URL = os.getenv("GROQ_CHAT_URL", "https://api.groq.com/openai/v1/chat/completions")
+# NOTE: API keys and most knobs are read at session START (see start_session),
+# not import time, because main.py imports this module before load_dotenv().
+# Legacy GROQ_* names remain as fallbacks.
+DEFAULT_LLM_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
+SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
-# ---- Deepgram STT (env-overridable) ----------------------------------------
-# nova-3 supports language=multi (Hindi/English/Gujarati code-mixing);
-# nova-2 does NOT support 'multi' — use nova-3 for Indian-language calls.
+# ---- Deepgram STT (env-overridable; re-read in start_session) --------------
+# nova-3 supports language=multi (Hindi/English/Gujarati code-mixing).
 STT_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-3")
 STT_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "multi")
-# Deepgram closes a turn after `endpointing` ms of silence. Lower = snappier
-# replies; the turn debounce below re-merges any over-eager splits.
-STT_ENDPOINTING_MS = os.getenv("DEEPGRAM_ENDPOINTING_MS", "300")
-STT_UTTERANCE_END_MS = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000")  # min Deepgram allows
 
 # ---- Sarvam TTS (env-overridable) ------------------------------------------
-SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "rahul")
 TTS_SAMPLE_RATE = int(os.getenv("SARVAM_TTS_SAMPLE_RATE", "24000"))
 
-# After a transcript arrives, wait this long for a continuation fragment and
-# merge it into the same turn instead of answering each fragment separately.
-TURN_DEBOUNCE_SECONDS = float(os.getenv("TURN_DEBOUNCE", "0.15"))
+# Call-start trigger from Twilio (and similar) — used for greeting shortcut.
+CALL_START_RE = re.compile(
+    r"(start the call|picked up the phone|__start__|begin the call)",
+    re.IGNORECASE,
+)
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def get_system_instruction():
+    # Keep this short — TTFT scales with prompt size (~250ms saved vs the old
+    # 3k-char prompt on Groq in our R&D bench).
     today = datetime.now()
     tomorrow = today + timedelta(days=1)
     day_after = today + timedelta(days=2)
-
-    date_context = f"""## TODAY'S DATE — USE THIS FOR ALL SCHEDULING
-- Today is {today.strftime('%Y-%m-%d')} ({today.strftime('%A')}).
-- "Kal" / "Tomorrow" = {tomorrow.strftime('%Y-%m-%d')} ({tomorrow.strftime('%A')}).
-- "Parso" / "Day after tomorrow" = {day_after.strftime('%Y-%m-%d')} ({day_after.strftime('%A')}).
-- Use TODAY as the reference for ALL pickup scheduling. NEVER confuse pickup dates with warranty, purchase, or service history dates — those are COMPLETELY DIFFERENT.
-- Pickup dates are ALWAYS in the near future (within 1-2 weeks from today).
-"""
-
-    return date_context + SYSTEM_INSTRUCTION
-
-
-SYSTEM_INSTRUCTION = """
-You are Rahul (ONLY ever "Rahul"), a warm, natural service advisor at Kataria
-Automobiles (spell it Kataria, NEVER "Katrina"), an authorized Maruti Suzuki
-dealership in Ahmedabad. You are on a LIVE PHONE CALL — your words are spoken aloud.
-
-OUTPUT (spoken):
-- Plain sentences only. NO markdown, asterisks, bullets, emojis.
-- Write in the NATIVE SCRIPT of the language you speak: Hindi/Marathi in Devanagari
-  (e.g. "नमस्ते, मैं राहुल बोल रहा हूँ"), Gujarati in Gujarati script, English in Latin.
-  NEVER write Hindi/Gujarati in roman letters. English tech words (service, pickup,
-  booking ID) may stay in Latin inside an Indian-language sentence.
-- Keep EVERY reply to 1–2 short sentences. Say ONE step, then wait for the reply.
-- NEVER speak your internal reasoning/plans. Only say what a real advisor would say
-  aloud. If the customer is busy or on hold, stay SILENT (don't narrate).
-
-FIRST STEP: At call start, IMMEDIATELY call get_vehicle_info. Never invent vehicle/
-owner details — only use tool data. Then say EXACTLY:
-"नमस्ते! मैं राहुल बोल रहा हूँ, Kataria Automobiles से. क्या मैं {owner_name} जी से बात कर सकता हूँ?"
-(use the real owner_name, first name only) then: "यह कॉल training और quality के लिए record हो रही है."
-
-LANGUAGE (top priority): Open in Hindi. From the customer's FIRST reply, auto-detect
-their language and switch FULLY to it (English→English, Gujarati→Gujarati,
-Marathi→Marathi, Hindi→Hindi) and STAY there. Also switch if they explicitly ask.
-Never mix languages after switching.
-
-CALL FLOW (one step at a time, wait after each):
-1. Mention their {vehicle_model} ({vehicle_number}) has its {Nth} service due.
-2. Ask to schedule it; pickup & drop are free.
-3. Confirm the pickup address (use the record's address, or a new one they give —
-   repeat it back).
-4. Ask preferred day & time.
-5. When day, time AND address are confirmed, CALL schedule_pickup (vehicle_number,
-   date, time, pickup_address). A verbal "confirmed" is NOT enough — you MUST call it.
-6. Share the returned booking ID and driver details.
-7. Close warmly: "धन्यवाद {name} जी. आपका दिन शुभ हो!"
-
-TOOLS (mandatory): get_vehicle_info at call start; schedule_pickup whenever they
-agree to a date/time; get_service_cost_estimate when they ask about price.
-
-IF customer says it's not their car: discard ALL prior vehicle data, apologize, ask
-their name and whether they have a Maruti with you. Never reuse the old data.
-
-PICKUP DATES are always in the near future (today +0–14 days). NEVER use warranty,
-purchase, or service-history dates. "14th" means the 14th of the CURRENT month.
-If unsure, ask.
-"""
+    return (
+        f"You are Rahul (ONLY Rahul) at Kataria Automobiles (spell Kataria, never Katrina), "
+        f"Maruti Suzuki dealership, Ahmedabad. LIVE phone call — words are spoken aloud.\n"
+        f"OUTPUT: plain speech only (no markdown/bullets/emoji). Native script "
+        f"(Hindi/Marathi Devanagari, Gujarati script, English Latin). Never romanize "
+        f"Indian languages. 1–2 short sentences per turn; one step then wait. Never "
+        f"narrate reasoning; if on hold stay silent.\n"
+        f"DATES: Today {today.strftime('%Y-%m-%d')} ({today.strftime('%A')}); "
+        f"kal/tomorrow={tomorrow.strftime('%Y-%m-%d')}; "
+        f"parso/day-after={day_after.strftime('%Y-%m-%d')}. Pickup dates are near-future "
+        f"(today+0–14d only). Never use warranty/purchase/service-history dates.\n"
+        f"LANGUAGE: open Hindi; after customer's first reply switch fully to their "
+        f"language (en/gu/mr/hi) and stay. Never mix.\n"
+        f"FLOW (wait after each): (1) name vehicle+service due (2) offer free pickup/drop "
+        f"(3) confirm address (4) ask day/time (5) MUST call schedule_pickup when all "
+        f"confirmed (6) share booking ID/driver (7) warm close. Call get_vehicle_info at "
+        f"start (never invent data); get_service_cost_estimate on price questions. If wrong "
+        f"car: discard data, apologize, ask name/Maruti status."
+    )
 
 # Tool declarations in OpenAI/Groq chat-completions format.
 TOOLS = [
@@ -223,21 +192,13 @@ def _tts_language_for(text: str) -> str:
 
 
 def _split_sentences(text: str, max_len: int = 140):
-    """Split reply into small TTS chunks so the FIRST chunk plays fast.
-
-    Sarvam TTS latency scales with text length (~0.6s for 20 chars, ~3.2s for
-    160). We break on sentence ends AND commas so the first audible chunk is
-    short and starts quickly; the pipeline in speak() synthesizes the rest in
-    the background while the first chunk plays, leaving no gap.
-    """
-    # Primary split on sentence terminators, secondary on commas/clause breaks.
+    """Split reply into TTS-friendly chunks (< ~500 chars for Sarvam WS)."""
     pieces = re.split(r"(?<=[।.!?])\s+|\n+", text)
     parts = []
     for p in pieces:
         p = p.strip()
         if not p:
             continue
-        # further split long pieces on commas to shorten the first chunk
         if len(p) > 60:
             parts.extend(s.strip() for s in re.split(r"(?<=[,।])\s+", p) if s.strip())
         else:
@@ -256,9 +217,57 @@ def _split_sentences(text: str, max_len: int = 140):
     return chunks or ([text.strip()] if text.strip() else [])
 
 
+def _first_name(owner_name: str) -> str:
+    name = (owner_name or "").strip()
+    if not name:
+        return "ग्राहक"
+    return name.split()[0]
+
+
+def _resolve_llm_config():
+    """Prefer OpenRouter (LLM_*/OPENROUTER_*); fall back to Groq as a set.
+
+    Never mix an OpenRouter URL with a Groq key (or vice versa).
+    """
+    openrouter_key = (
+        os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or ""
+    ).strip()
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+
+    if openrouter_key:
+        chat_url = (
+            os.getenv("LLM_CHAT_URL")
+            or DEFAULT_LLM_CHAT_URL
+        )
+        model = (
+            os.getenv("LLM_MODEL")
+            or DEFAULT_LLM_MODEL
+        )
+        return chat_url, model, openrouter_key
+
+    if groq_key:
+        chat_url = (
+            os.getenv("GROQ_CHAT_URL")
+            or "https://api.groq.com/openai/v1/chat/completions"
+        )
+        model = (
+            os.getenv("GROQ_LLM_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "openai/gpt-oss-20b"
+        )
+        return chat_url, model, groq_key
+
+    # No keys — still return OpenRouter defaults so errors are clear.
+    return (
+        os.getenv("LLM_CHAT_URL") or DEFAULT_LLM_CHAT_URL,
+        os.getenv("LLM_MODEL") or DEFAULT_LLM_MODEL,
+        "",
+    )
+
+
 class VoiceAgent:
     """
-    Deepgram STT -> Groq LLM -> Sarvam TTS voice agent session.
+    Deepgram STT -> OpenRouter/Cerebras LLM -> Sarvam streaming TTS voice agent.
 
     Exposes the app's standard engine interface: same constructor shape and
     the same `start_session` async-generator interface.
@@ -269,24 +278,46 @@ class VoiceAgent:
         """
         Args:
             api_key: unused (kept for interface compatibility) — provider keys
-                     come from env (DEEPGRAM_API_KEY, GROQ_API_KEY, SARVAM_API_KEY).
-            model: Groq chat model (e.g. 'llama-3.3-70b-versatile').
+                     come from env (DEEPGRAM_API_KEY, LLM_API_KEY / GROQ_API_KEY,
+                     SARVAM_API_KEY).
+            model: chat model id (e.g. 'openai/gpt-oss-120b').
             input_sample_rate: caller audio sample rate (PCM16 mono).
             tools: tool declarations (chat-completions format).
             tool_mapping: tool name -> python callable.
         """
-        self.model = model or os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-120b")
+        _, default_model, _ = _resolve_llm_config()
+        self.model = model or default_model
         self.input_sample_rate = input_sample_rate
         self.tools = tools or TOOLS
         self.tool_mapping = tool_mapping or {}
 
     async def start_session(self, audio_input_queue, video_input_queue, text_input_queue,
                             audio_output_callback, audio_interrupt_callback=None):
-        # Read keys now (env is guaranteed loaded by the time a session starts).
+        # Read keys / knobs now (env is guaranteed loaded by the time a session starts).
         deepgram_key = os.getenv("DEEPGRAM_API_KEY", "")
-        groq_key = os.getenv("GROQ_API_KEY", "")
+        llm_chat_url, _, llm_key = _resolve_llm_config()
+        # Prefer constructor model, else fresh env (may have changed after import).
+        model = self.model or _resolve_llm_config()[1]
         sarvam_key = os.getenv("SARVAM_API_KEY", "")
-        http = httpx.AsyncClient(timeout=45.0)
+        stt_model = os.getenv("DEEPGRAM_MODEL", STT_MODEL)
+        stt_language = os.getenv("DEEPGRAM_LANGUAGE", STT_LANGUAGE)
+        stt_endpointing_ms = os.getenv("DEEPGRAM_ENDPOINTING_MS", "250")
+        stt_utterance_end_ms = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000")
+        turn_debounce = _env_float("TURN_DEBOUNCE", 0.15)
+        use_openrouter = "openrouter.ai" in llm_chat_url
+
+        try:
+            http = httpx.AsyncClient(
+                http2=True,
+                timeout=45.0,
+                limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=60.0),
+            )
+        except Exception:
+            # h2 package missing — fall back to HTTP/1.1
+            http = httpx.AsyncClient(
+                timeout=45.0,
+                limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=60.0),
+            )
 
         event_queue = asyncio.Queue()
         turn_queue = asyncio.Queue()
@@ -294,6 +325,7 @@ class VoiceAgent:
 
         speaking = {"on": False}       # agent audio is being sent out right now
         current_turn = {"task": None}  # in-flight agent turn task
+        greeted = {"done": False}
 
         async def emit(event):
             await event_queue.put(event)
@@ -313,16 +345,16 @@ class VoiceAgent:
         # ---- Deepgram STT: stream caller audio, receive transcripts ---------
         async def stt_loop():
             params = {
-                "model": STT_MODEL,
-                "language": STT_LANGUAGE,
+                "model": stt_model,
+                "language": stt_language,
                 "encoding": "linear16",
                 "sample_rate": self.input_sample_rate,
                 "channels": 1,
                 "interim_results": "true",
                 "punctuate": "true",
                 "smart_format": "true",
-                "endpointing": STT_ENDPOINTING_MS,
-                "utterance_end_ms": STT_UTTERANCE_END_MS,
+                "endpointing": stt_endpointing_ms,
+                "utterance_end_ms": stt_utterance_end_ms,
                 "vad_events": "true",
             }
             url = f"{DEEPGRAM_WS_URL}?{urlencode(params)}"
@@ -336,12 +368,12 @@ class VoiceAgent:
                 try:
                     async with websockets.connect(url, additional_headers=headers,
                                                   max_size=None) as ws:
-                        logger.info(f"Deepgram STT connected (model={STT_MODEL}, lang={STT_LANGUAGE})")
+                        logger.info(f"Deepgram STT connected (model={stt_model}, "
+                                    f"lang={stt_language}, endpointing={stt_endpointing_ms}ms)")
                         failures = 0
 
                         async def pump_audio():
                             nonlocal stt_secs_pending
-                            keepalive = 0.0
                             while True:
                                 try:
                                     chunk = await asyncio.wait_for(
@@ -429,55 +461,87 @@ class VoiceAgent:
             while True:
                 await video_input_queue.get()
 
-        # ---- LLM (Groq, OpenAI-compatible, STREAMING) -----------------------
+        # ---- LLM (OpenAI-compatible streaming) ------------------------------
         # Streams token deltas. As soon as a complete sentence/clause of spoken
         # text is available it is pushed to `on_sentence` so TTS can start while
-        # the model is still generating. Returns the assembled message
-        # {content, tool_calls} once the stream ends. Tool-call deltas are
-        # accumulated by index (OpenAI streaming format).
+        # the model is still generating.
         async def chat_completion_stream(msgs, on_sentence=None):
             payload = {
-                "model": self.model,
+                "model": model,
                 "messages": msgs,
                 "temperature": 0.4,
-                "max_tokens": 400,
+                "max_tokens": 220,
                 "tools": self.tools,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
-            headers = {"Authorization": f"Bearer {groq_key}",
-                       "Content-Type": "application/json"}
+            if use_openrouter:
+                # R&D bench: Groq TTFT beat Cerebras on OpenRouter for this prompt
+                # (~390ms vs ~550ms). Cerebras stays as fast fallback (higher tok/s).
+                payload["provider"] = {
+                    "order": ["Groq", "Cerebras"],
+                    "allow_fallbacks": True,
+                }
+
+            headers = {
+                "Authorization": f"Bearer {llm_key}",
+                "Content-Type": "application/json",
+            }
+            if use_openrouter:
+                headers["HTTP-Referer"] = os.getenv(
+                    "PUBLIC_URL", "https://voice-v1.onrender.com")
+                headers["X-Title"] = "Kataria Voice Agent"
 
             content_parts = []
             tool_calls = {}   # index -> {id, name, arguments}
             pending = ""      # spoken text not yet flushed as a sentence
             finish_reason = None
+            emitted_any = False  # True after first TTS chunk was handed off
 
             async def flush_sentences(force=False):
-                nonlocal pending
+                nonlocal pending, emitted_any
                 if not on_sentence:
                     return
-                # Emit each complete sentence/clause; keep the tail buffered.
                 while True:
                     chunks = _split_sentences(pending)
-                    # If not forcing, only emit chunks we're sure are complete
-                    # (i.e. there is text after the last boundary, or force).
                     if force:
                         for c in chunks:
                             await on_sentence(c)
+                            emitted_any = True
                         pending = ""
                         return
-                    if len(chunks) <= 1:
-                        return
-                    first = chunks[0]
-                    await on_sentence(first)
-                    # remove the emitted chunk from the front of `pending`
-                    idx = pending.find(first)
-                    pending = pending[idx + len(first):].lstrip(" ,।") if idx >= 0 else ""
-
+                    if len(chunks) > 1:
+                        first = chunks[0]
+                        await on_sentence(first)
+                        emitted_any = True
+                        idx = pending.find(first)
+                        pending = (
+                            pending[idx + len(first):].lstrip(" ,।")
+                            if idx >= 0 else ""
+                        )
+                        continue
+                    # Early first-audio: don't wait for a full sentence — flush
+                    # ~25 chars at a word/clause break so TTS starts while LLM
+                    # is still generating (R&D: ~200-300ms earlier first audio).
+                    if not emitted_any and len(pending) >= 25:
+                        break_at = -1
+                        for sep in ("।", "!", "?", ".", ",", " "):
+                            pos = pending.rfind(sep)
+                            if pos > break_at:
+                                break_at = pos
+                        if break_at >= 15:
+                            if pending[break_at] in "।!?,.":
+                                first = pending[: break_at + 1].strip()
+                            else:
+                                first = pending[:break_at].strip()
+                            if first:
+                                await on_sentence(first)
+                                emitted_any = True
+                                pending = pending[len(first):].lstrip(" ,।")
+                    return
             for attempt in range(4):
                 try:
-                    async with http.stream("POST", GROQ_CHAT_URL, headers=headers,
+                    async with http.stream("POST", llm_chat_url, headers=headers,
                                            json=payload) as resp:
                         if resp.status_code == 429:
                             await resp.aread()
@@ -487,7 +551,7 @@ class VoiceAgent:
                             except ValueError:
                                 pass
                             wait = min(retry_after + 0.3, 8.0)
-                            logger.warning(f"Groq rate limit, waiting {wait:.1f}s "
+                            logger.warning(f"LLM rate limit, waiting {wait:.1f}s "
                                            f"(attempt {attempt + 1}/4)")
                             await asyncio.sleep(wait)
                             continue
@@ -531,13 +595,12 @@ class VoiceAgent:
                                     slot["name"] = fn["name"]
                                 if fn.get("arguments"):
                                     slot["arguments"] += fn["arguments"]
-                        # stream finished
                         await flush_sentences(force=True)
                         break
                 except httpx.HTTPStatusError:
                     raise
             else:
-                raise RuntimeError("Groq streaming failed after retries")
+                raise RuntimeError("LLM streaming failed after retries")
 
             content = "".join(content_parts)
             tcs = [
@@ -560,28 +623,94 @@ class VoiceAgent:
             except Exception as e:
                 return f"Error: {e}"
 
-        # ---- TTS (Sarvam Bulbul, REST) --------------------------------------
-        async def synth(sentence, lang):
-            payload = {
-                "text": sentence,
-                "target_language_code": lang,
-                "speaker": TTS_SPEAKER,
-                "model": TTS_MODEL,
-                "speech_sample_rate": TTS_SAMPLE_RATE,
-                "output_audio_codec": "wav",
-            }
-            resp = await http.post(
-                SARVAM_TTS_URL,
-                headers={"api-subscription-key": sarvam_key,
-                         "Content-Type": "application/json"},
-                json=payload,
-            )
-            resp.raise_for_status()
-            return resp.json().get("audios") or []
+        # ---- TTS helpers (session-scoped reusable WebSocket) ----------------
+        tts = {"ws": None, "lang": None}
+        # Pre-synthesized PCM clips (filled during prewarm). Keys are stable
+        # phrase ids — used for ack-filler and zero-latency stock lines.
+        pcm_cache = {}
+        vehicle_prefetch = {"data": None, "done": False}
+
+        async def _close_tts():
+            ws = tts["ws"]
+            tts["ws"] = None
+            tts["lang"] = None
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+        def _tts_alive():
+            ws = tts["ws"]
+            if ws is None:
+                return False
+            try:
+                # websockets v12+: State.OPEN; older: .closed flag
+                state = getattr(ws, "state", None)
+                if state is not None:
+                    return getattr(state, "name", str(state)) == "OPEN"
+                return not getattr(ws, "closed", False)
+            except Exception:
+                return False
+
+        async def _ensure_tts(lang):
+            """Reuse one Sarvam WS for the whole call; reconfigure on lang change."""
+            if not _tts_alive():
+                tts["ws"] = None
+                tts["lang"] = None
+            if tts["ws"] is None:
+                url = (f"{SARVAM_TTS_WS_URL}?model={TTS_MODEL}"
+                       f"&send_completion_event=true")
+                headers = {"Api-Subscription-Key": sarvam_key}
+                tts["ws"] = await websockets.connect(
+                    url, additional_headers=headers, max_size=None)
+                tts["lang"] = None
+            if tts["lang"] != lang:
+                await tts["ws"].send(json.dumps({
+                    "type": "config",
+                    "data": {
+                        "language_code": lang,
+                        "target_language_code": lang,
+                        "speaker": TTS_SPEAKER,
+                        "model": TTS_MODEL,
+                        "speech_sample_rate": str(TTS_SAMPLE_RATE),
+                        "output_audio_codec": "linear16",
+                        "min_buffer_size": 30,
+                        "max_chunk_length": 80,
+                    },
+                }))
+                tts["lang"] = lang
+            return tts["ws"]
+
+        async def _synth_to_pcm(text, lang="hi-IN"):
+            """One-shot synthesize via the shared WS; return raw PCM bytes."""
+            ws = await _ensure_tts(lang)
+            await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+            await ws.send(json.dumps({"type": "flush"}))
+            parts = []
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    continue
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+                if mtype == "audio":
+                    audio_b64 = (msg.get("data") or {}).get("audio")
+                    if audio_b64:
+                        parts.append(_strip_wav_header(base64.b64decode(audio_b64)))
+                elif mtype == "event":
+                    if (msg.get("data") or {}).get("event_type") == "final":
+                        break
+                elif mtype == "error":
+                    err = (msg.get("data") or {}).get("message") or str(msg)
+                    raise RuntimeError(f"Sarvam TTS WS error: {err}")
+            pcm = b"".join(parts)
+            if pcm:
+                await emit({"type": "usage", "tts_chars": len(text)})
+            return pcm
 
         async def _emit_audio(pcm):
-            # Send in ~120ms chunks so barge-in cancellation is responsive.
-            step = int(TTS_SAMPLE_RATE * 2 * 0.12)
+            # Send in ~60ms chunks so barge-in cancellation is responsive.
+            step = int(TTS_SAMPLE_RATE * 2 * 0.06)
             for i in range(0, len(pcm), step):
                 if inspect.iscoroutinefunction(audio_output_callback):
                     await audio_output_callback(pcm[i:i + step])
@@ -589,54 +718,255 @@ class VoiceAgent:
                     audio_output_callback(pcm[i:i + step])
                 await asyncio.sleep(0)  # yield so a cancel can land between chunks
 
-        async def synth_chunk(s):
-            audios = await synth(s, _tts_language_for(s))
-            await emit({"type": "usage", "tts_chars": len(s)})
-            return b"".join(_strip_wav_header(base64.b64decode(a)) for a in audios)
+        async def speak_stream(sentence_queue, lang):
+            """Stream text into Sarvam TTS WebSocket; play PCM as it arrives.
 
-        async def speak_stream(sentence_queue):
-            """Consume sentences from a queue as the LLM streams them, synthesize
-            them (each synthesis kicked off the instant the sentence arrives, so
-            they overlap) and emit audio strictly in order. None ends the stream."""
-            synth_tasks = []   # ordered in-flight/complete synthesis tasks
-            play_idx = 0
+            Reuses the session WebSocket (R&D: ~40-50ms faster than reconnect).
+            """
+            chars_sent = 0
             try:
-                while True:
-                    sentence = await sentence_queue.get()
-                    if sentence is not None:
-                        synth_tasks.append(asyncio.create_task(synth_chunk(sentence)))
-                    # play everything we can, in order, without getting ahead
-                    if sentence is None:
-                        while play_idx < len(synth_tasks):
-                            await _emit_audio(await synth_tasks[play_idx])
-                            play_idx += 1
-                        return
-                    # opportunistically play any already-finished leading chunks
-                    while play_idx < len(synth_tasks) and synth_tasks[play_idx].done():
-                        await _emit_audio(await synth_tasks[play_idx])
-                        play_idx += 1
+                ws = await _ensure_tts(lang)
+
+                async def sender():
+                    nonlocal chars_sent
+                    while True:
+                        sentence = await sentence_queue.get()
+                        if sentence is None:
+                            await ws.send(json.dumps({"type": "flush"}))
+                            return
+                        if not sentence.strip():
+                            continue
+                        chars_sent += len(sentence)
+                        await ws.send(json.dumps({
+                            "type": "text",
+                            "data": {"text": sentence},
+                        }))
+
+                send_task = asyncio.create_task(sender())
+                try:
+                    async for raw in ws:
+                        if isinstance(raw, bytes):
+                            continue
+                        msg = json.loads(raw)
+                        mtype = msg.get("type")
+                        if mtype == "audio":
+                            audio_b64 = (msg.get("data") or {}).get("audio")
+                            if not audio_b64:
+                                continue
+                            pcm = _strip_wav_header(base64.b64decode(audio_b64))
+                            if pcm:
+                                await _emit_audio(pcm)
+                        elif mtype == "event":
+                            et = (msg.get("data") or {}).get("event_type")
+                            if et == "final":
+                                break
+                        elif mtype == "error":
+                            err = (msg.get("data") or {}).get("message") or str(msg)
+                            raise RuntimeError(f"Sarvam TTS WS error: {err}")
+                finally:
+                    if not send_task.done():
+                        send_task.cancel()
+                        try:
+                            await send_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+            except asyncio.CancelledError:
+                # Barge-in: drop the socket so the next turn starts clean.
+                await _close_tts()
+                raise
+            except Exception:
+                await _close_tts()
+                raise
             finally:
-                for t in synth_tasks[play_idx:]:
-                    if not t.done():
-                        t.cancel()
+                if chars_sent:
+                    await emit({"type": "usage", "tts_chars": chars_sent})
+
+        async def speak_text(text, lang=None):
+            """Speak a fully-known string via streaming TTS."""
+            if not text or not text.strip():
+                return
+            lang = lang or _tts_language_for(text)
+            sentence_queue = asyncio.Queue()
+            speak_task = asyncio.create_task(speak_stream(sentence_queue, lang))
+            for chunk in _split_sentences(text):
+                await sentence_queue.put(chunk)
+            await sentence_queue.put(None)
+            await speak_task
+
+        async def play_ack_filler(started_speaking):
+            """If LLM is slow (>200ms), play a cached 'हाँ' to mask dead air.
+
+            Cancelled as soon as the real reply starts so audio never overlaps.
+            """
+            try:
+                await asyncio.sleep(0.20)
+            except asyncio.CancelledError:
+                return
+            if started_speaking["v"]:
+                return
+            pcm = pcm_cache.get("haan")
+            if not pcm:
+                return
+            speaking["on"] = True
+            try:
+                await _emit_audio(pcm)
+            except asyncio.CancelledError:
+                if audio_interrupt_callback:
+                    if inspect.iscoroutinefunction(audio_interrupt_callback):
+                        await audio_interrupt_callback()
+                    else:
+                        audio_interrupt_callback()
+                raise
+            finally:
+                if not started_speaking["v"]:
+                    speaking["on"] = False
+
+        # ---- connection prewarm --------------------------------------------
+        async def prewarm_connections():
+            # Prefetch vehicle so greeting doesn't wait on the tool.
+            try:
+                vehicle_prefetch["data"] = await run_tool("get_vehicle_info", {})
+                vehicle_prefetch["done"] = True
+            except Exception as e:
+                logger.warning(f"Vehicle prefetch failed: {e}")
+
+            # Warm LLM TLS + prompt-prefix cache (short system prompt).
+            try:
+                headers = {
+                    "Authorization": f"Bearer {llm_key}",
+                    "Content-Type": "application/json",
+                }
+                if use_openrouter:
+                    headers["HTTP-Referer"] = os.getenv(
+                        "PUBLIC_URL", "https://voice-v1.onrender.com")
+                    headers["X-Title"] = "Kataria Voice Agent"
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": get_system_instruction()},
+                        {"role": "user", "content": "."},
+                    ],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                }
+                if use_openrouter:
+                    payload["provider"] = {
+                        "order": ["Groq", "Cerebras"],
+                        "allow_fallbacks": True,
+                    }
+                resp = await http.post(llm_chat_url, headers=headers, json=payload)
+                logger.info(f"LLM prewarm status={resp.status_code}")
+            except Exception as e:
+                logger.warning(f"LLM prewarm failed: {e}")
+
+            # Open Sarvam TTS WS + cache a short ack filler ("हाँ") for dead-air mask.
+            try:
+                await _ensure_tts("hi-IN")
+                haan = await _synth_to_pcm("हाँ।", lang="hi-IN")
+                if haan:
+                    pcm_cache["haan"] = haan
+                    logger.info(f"Ack filler cached ({len(haan)} bytes PCM)")
+                logger.info("Sarvam TTS WebSocket prewarmed (reused for call)")
+            except Exception as e:
+                logger.warning(f"Sarvam TTS prewarm failed: {e}")
+                await _close_tts()
+
+        # ---- greeting shortcut (skip 2 LLM roundtrips on call start) -------
+        async def run_greeting():
+            speaking["on"] = True
+            try:
+                if vehicle_prefetch["done"] and vehicle_prefetch["data"] is not None:
+                    vehicle = vehicle_prefetch["data"]
+                else:
+                    vehicle = await run_tool("get_vehicle_info", {})
+                await emit({
+                    "type": "tool_call",
+                    "name": "get_vehicle_info",
+                    "args": {},
+                    "result": vehicle,
+                })
+
+                owner = ""
+                if isinstance(vehicle, dict):
+                    owner = _first_name(vehicle.get("owner_name") or "")
+                else:
+                    owner = "ग्राहक"
+
+                greeting = (
+                    f"नमस्ते! मैं राहुल बोल रहा हूँ, Kataria Automobiles से. "
+                    f"क्या मैं {owner} जी से बात कर सकता हूँ?"
+                )
+                record_note = "यह कॉल training और quality के लिए record हो रही है."
+                full = f"{greeting} {record_note}"
+
+                # Seed chat history so later turns have full vehicle context.
+                tool_call_id = "call_greeting_get_vehicle_info"
+                messages.append({"role": "user", "content": "[call connected]"})
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "get_vehicle_info",
+                            "arguments": "{}",
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(vehicle, ensure_ascii=False, default=str),
+                })
+                messages.append({"role": "assistant", "content": full})
+
+                await emit({"type": "agent", "text": full})
+                await speak_text(full, lang="hi-IN")
+                await emit({"type": "turn_complete"})
+            finally:
+                speaking["on"] = False
 
         # ---- one agent turn: LLM (+tools) then TTS, all streamed ------------
         async def run_turn(user_text):
             messages.append({"role": "user", "content": user_text})
-            for _ in range(5):  # tool-call loop guard
-                # A sentence queue drives TTS in parallel with LLM generation.
+            for hop in range(5):  # tool-call loop guard
                 sentence_queue = asyncio.Queue()
                 agent_text_parts = []
                 started_speaking = {"v": False}
                 speak_task = None
+                speak_lang = {"v": None}
+                # Ack filler only on the first hop of a user turn (masks LLM TTFT).
+                # Skipped on tool follow-up hops so we don't say "हाँ" mid-tool.
+                filler_task = (
+                    asyncio.create_task(play_ack_filler(started_speaking))
+                    if hop == 0 else None
+                )
+
+                async def stop_filler():
+                    if not filler_task or filler_task.done():
+                        return
+                    filler_task.cancel()
+                    try:
+                        await filler_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    if audio_interrupt_callback and speaking["on"]:
+                        if inspect.iscoroutinefunction(audio_interrupt_callback):
+                            await audio_interrupt_callback()
+                        else:
+                            audio_interrupt_callback()
+                        speaking["on"] = False
 
                 async def on_sentence(s):
-                    # First spoken chunk: flip speaking flag + start the player.
                     nonlocal speak_task
+                    await stop_filler()
                     if not started_speaking["v"]:
                         started_speaking["v"] = True
                         speaking["on"] = True
-                        speak_task = asyncio.create_task(speak_stream(sentence_queue))
+                        speak_lang["v"] = _tts_language_for(s)
+                        speak_task = asyncio.create_task(
+                            speak_stream(sentence_queue, speak_lang["v"]))
                     agent_text_parts.append(s)
                     await emit({"type": "agent", "text": s})
                     await sentence_queue.put(s)
@@ -644,6 +974,7 @@ class VoiceAgent:
                 try:
                     reply = await chat_completion_stream(messages, on_sentence)
                 finally:
+                    await stop_filler()
                     if started_speaking["v"]:
                         await sentence_queue.put(None)  # end the audio stream
                         if speak_task:
@@ -651,6 +982,8 @@ class VoiceAgent:
                                 await speak_task
                             finally:
                                 speaking["on"] = False
+                    else:
+                        speaking["on"] = False
 
                 tool_calls = reply.get("tool_calls") or []
                 if tool_calls:
@@ -690,11 +1023,20 @@ class VoiceAgent:
                 while True:
                     try:
                         more = await asyncio.wait_for(
-                            turn_queue.get(), timeout=TURN_DEBOUNCE_SECONDS)
+                            turn_queue.get(), timeout=turn_debounce)
                         user_text = f"{user_text} {more}".strip()
                     except asyncio.TimeoutError:
                         break
-                current_turn["task"] = asyncio.create_task(run_turn(user_text))
+
+                # First call-start trigger: skip LLM, greet immediately.
+                if (not greeted["done"]) and CALL_START_RE.search(user_text):
+                    greeted["done"] = True
+                    current_turn["task"] = asyncio.create_task(run_greeting())
+                else:
+                    if not greeted["done"]:
+                        greeted["done"] = True
+                    current_turn["task"] = asyncio.create_task(run_turn(user_text))
+
                 try:
                     await current_turn["task"]
                 except asyncio.CancelledError:
@@ -711,10 +1053,15 @@ class VoiceAgent:
             asyncio.create_task(text_loop()),
             asyncio.create_task(video_drain_loop()),
             asyncio.create_task(agent_loop()),
+            asyncio.create_task(prewarm_connections()),
         ]
 
-        logger.info(f"Voice agent started (stt=deepgram/{STT_MODEL}, "
-                    f"llm=groq/{self.model}, tts=sarvam/{TTS_MODEL}/{TTS_SPEAKER})")
+        logger.info(
+            f"Voice agent started (stt=deepgram/{stt_model}, "
+            f"llm={llm_chat_url.split('//')[-1].split('/')[0]}/{model}, "
+            f"tts=sarvam-ws/{TTS_MODEL}/{TTS_SPEAKER}, "
+            f"endpointing={stt_endpointing_ms}ms, debounce={turn_debounce}s)"
+        )
         try:
             while True:
                 event = await event_queue.get()
@@ -730,5 +1077,6 @@ class VoiceAgent:
             if inflight and not inflight.done():
                 inflight.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await _close_tts()
             await http.aclose()
             logger.info("Voice agent session closed")

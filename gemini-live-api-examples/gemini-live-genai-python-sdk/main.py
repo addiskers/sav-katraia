@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from voice_agent import VoiceAgent
+from voice_agent import VoiceAgent, _resolve_llm_config
 from twilio_handler import TwilioMediaBridge
 
 import pricing
@@ -28,8 +28,8 @@ logging.getLogger("voice_agent").setLevel(logging.INFO)
 logging.getLogger(__name__).setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-MODEL = os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-120b")
+# Configuration (matches voice_agent provider resolution)
+_, MODEL, _ = _resolve_llm_config()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+19785715824")

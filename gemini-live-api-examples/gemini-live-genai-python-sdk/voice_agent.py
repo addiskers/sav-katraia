@@ -246,15 +246,16 @@ def _update_customer_language(text: str, current: str, en_streak: dict | None = 
 
 
 def _turn_confidence_floor(text: str, base_min: float) -> float:
-    """Latin-only STT on Hindi calls is often garbage — require higher confidence."""
+    """Confidence threshold for accepting a user turn."""
     if _has_indic_script(text):
         return base_min
     words = [w for w in re.split(r"\s+", (text or "").strip()) if w]
-    if len(words) <= 2:
-        return max(base_min, _env_float("STT_LATIN_SHORT_CONF", 0.78))
+    # Short acks ("hello", "haan") — Hindi STT often scores 0.3–0.5; trust structure.
+    if len(words) <= 3:
+        return base_min
     if len(words) <= 4:
-        return max(base_min, _env_float("STT_LATIN_MEDIUM_CONF", 0.68))
-    return max(base_min, _env_float("STT_LATIN_MIN_CONF", 0.58))
+        return max(base_min, _env_float("STT_LATIN_MEDIUM_CONF", 0.55))
+    return max(base_min, _env_float("STT_LATIN_MIN_CONF", 0.50))
 
 
 def _language_hint(lang_code: str) -> str:
@@ -524,12 +525,14 @@ class VoiceAgent:
                     audio_interrupt_callback()
             await emit({"type": "interrupted"})
 
-        async def soft_mute_playback(reason="SpeechStarted"):
-            """Stop what the caller hears WITHOUT killing the LLM turn.
+        async def _clear_soft_mute(resume=False):
+            audio_drop_until["t"] = 0.0
+            audio_drop_until["armed"] = False
+            if resume:
+                logger.info("Soft-mute cleared — resuming agent audio")
 
-            Extends the mute window on repeated VAD. If mute expires without a
-            transcript, hard-cancel so we never resume talking over the caller.
-            """
+        async def soft_mute_playback(reason="SpeechStarted"):
+            """Stop what the caller hears WITHOUT killing the LLM turn."""
             if not barge_in_ok["v"] or not speaking["on"]:
                 return False
             if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
@@ -640,13 +643,8 @@ class VoiceAgent:
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
-                                    # Real text while agent speaks / soft-muted → hard-cancel.
-                                    # force=True once soft-muted (caller clearly interrupting).
-                                    if (speaking["on"] or audio_drop_until["armed"]) and _allows_barge_in(text):
-                                        await interrupt_agent(
-                                            "interim",
-                                            force=bool(audio_drop_until["armed"]),
-                                        )
+                                    # Do NOT hard-cancel on interim text — wait for a
+                                    # validated speech_final in _finish_utterance.
                                     if msg.get("is_final"):
                                         pending_final.append({
                                             "text": text,
@@ -700,15 +698,12 @@ class VoiceAgent:
             score, reason = _utterance_confidence(text, alt_confidence, all_words)
 
             if reason != "ok":
-                # False VAD / garbage — clear soft-mute so agent can resume.
-                audio_drop_until["t"] = 0.0
-                audio_drop_until["armed"] = False
+                await _clear_soft_mute(resume=True)
                 logger.info(f"STT rejected ({reason}): text={text!r}")
                 return False
 
             if not _allows_turn(score, _turn_confidence_floor(text, stt_min_confidence)):
-                audio_drop_until["t"] = 0.0
-                audio_drop_until["armed"] = False
+                await _clear_soft_mute(resume=True)
                 logger.info(
                     f"STT rejected (low_confidence): score={score} text={text!r}")
                 return False
@@ -729,7 +724,7 @@ class VoiceAgent:
                 customer_lang["hint_sent"] = False
                 logger.info(f"Customer language updated: {customer_lang['v']}")
 
-            if try_barge_in:
+            if try_barge_in and agent_busy["v"]:
                 await interrupt_agent("speech_final", force=True)
 
             await emit({"type": "user", "text": text})
@@ -951,13 +946,9 @@ class VoiceAgent:
 
         async def _emit_audio(pcm):
             now = time.monotonic()
-            # Soft-mute expired → hard-cancel (never resume talking over caller).
+            # Mute expired without a validated user turn → resume agent audio.
             if audio_drop_until["armed"] and now >= audio_drop_until["t"]:
-                audio_drop_until["armed"] = False
-                audio_drop_until["t"] = 0.0
-                asyncio.create_task(
-                    interrupt_agent("soft_mute_expired", force=True))
-                return
+                await _clear_soft_mute(resume=True)
             if now < audio_drop_until["t"]:
                 return
             # Mark speaking only when PCM actually leaves — never while waiting

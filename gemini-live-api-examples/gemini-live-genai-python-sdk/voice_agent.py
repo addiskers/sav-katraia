@@ -453,9 +453,9 @@ class VoiceAgent:
         sarvam_key = os.getenv("SARVAM_API_KEY", "")
         stt_model = os.getenv("DEEPGRAM_MODEL", STT_MODEL)
         stt_language = os.getenv("DEEPGRAM_LANGUAGE", STT_LANGUAGE)
-        stt_endpointing_ms = os.getenv("DEEPGRAM_ENDPOINTING_MS", "450")
-        stt_utterance_end_ms = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1500")
-        turn_debounce = _env_float("TURN_DEBOUNCE", 0.15)
+        stt_endpointing_ms = os.getenv("DEEPGRAM_ENDPOINTING_MS", "300")
+        stt_utterance_end_ms = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000")
+        turn_debounce = _env_float("TURN_DEBOUNCE", 0.08)
         stt_min_confidence = _env_float("STT_MIN_CONFIDENCE", 0.45)
         use_openrouter = "openrouter.ai" in llm_chat_url
 
@@ -487,24 +487,58 @@ class VoiceAgent:
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
         barge_in_ok = {"v": False}
-        # Grace only for VAD SpeechStarted (echo protection). Real transcripts force-cancel.
+        # Grace only for VAD soft-mute (echo protection).
         BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.35"))
+        # After a reply starts, ignore trailing speech_final that would re-cancel it.
+        REPLY_GUARD_S = float(os.getenv("REPLY_GUARD_S", "1.0"))
+        SOFT_MUTE_S = float(os.getenv("SOFT_MUTE_S", "1.25"))
+        audio_drop_until = {"t": 0.0}
+        reply_guard_until = {"t": 0.0}
+        last_utt = {"text": "", "t": 0.0}
 
 
         async def emit(event):
             await event_queue.put(event)
+
+        async def _flush_client_audio():
+            if audio_interrupt_callback:
+                if inspect.iscoroutinefunction(audio_interrupt_callback):
+                    await audio_interrupt_callback()
+                else:
+                    audio_interrupt_callback()
+            await emit({"type": "interrupted"})
+
+        async def soft_mute_playback(reason="SpeechStarted"):
+            """Stop what the caller hears WITHOUT killing the LLM turn.
+
+            SpeechStarted alone used to cancel the turn → dead air until STT
+            finalized (often 3–5s). Soft-mute drops PCM + flushes the browser;
+            hard cancel happens only when real transcript text arrives.
+            """
+            if not barge_in_ok["v"] or not speaking["on"]:
+                return False
+            if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
+                return False
+            audio_drop_until["t"] = time.monotonic() + SOFT_MUTE_S
+            logger.info(f"Soft-mute ({reason})")
+            await _flush_client_audio()
+            return True
 
         # ---- barge-in -------------------------------------------------------
         async def interrupt_agent(reason="speech", *, force=False):
             """Cancel the in-flight agent turn and flush client audio.
 
             force=True: skip echo grace (use when Deepgram has real transcript text).
-            force=False: apply grace window (SpeechStarted VAD can be TTS echo).
             """
             if not barge_in_ok["v"]:
                 return False
             task = current_turn["task"]
             if not task or task.done() or not agent_busy["v"]:
+                return False
+            # Trailing speech_final must not kill a reply that just started
+            # generating (same utterance that triggered the turn).
+            if time.monotonic() < reply_guard_until["t"] and not speaking["on"]:
+                logger.info(f"Barge-in ignored (reply guard): {reason}")
                 return False
             if not force and speaking["on"]:
                 if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
@@ -512,13 +546,9 @@ class VoiceAgent:
             logger.info(f"Barge-in ({reason}, force={force})")
             speaking["on"] = False
             agent_busy["v"] = False
+            audio_drop_until["t"] = 0.0
             task.cancel()
-            if audio_interrupt_callback:
-                if inspect.iscoroutinefunction(audio_interrupt_callback):
-                    await audio_interrupt_callback()
-                else:
-                    audio_interrupt_callback()
-            await emit({"type": "interrupted"})
+            await _flush_client_audio()
             return True
 
         # ---- Deepgram STT: stream caller audio, receive transcripts ---------
@@ -580,17 +610,17 @@ class VoiceAgent:
                                 mtype = msg.get("type")
 
                                 if mtype == "SpeechStarted":
-                                    # Fast VAD barge-in while TTS is playing (grace applies).
+                                    # Mute playback only — do NOT cancel the turn
+                                    # (cancelling here caused 3–5s dead air).
                                     if speaking["on"]:
-                                        await interrupt_agent("SpeechStarted", force=False)
+                                        await soft_mute_playback("SpeechStarted")
                                 elif mtype == "Results":
                                     alt = (((msg.get("channel") or {}).get("alternatives")
                                             or [{}])[0])
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
-                                    # Interim text while agent speaks → stop after echo grace
-                                    # (force=False). Final transcripts force-cancel immediately.
+                                    # Real text while agent speaks → hard-cancel.
                                     if speaking["on"] and _allows_barge_in(text):
                                         await interrupt_agent("interim", force=False)
                                     if msg.get("is_final"):
@@ -645,19 +675,26 @@ class VoiceAgent:
 
             score, reason = _utterance_confidence(text, alt_confidence, all_words)
 
-            # Force-cancel any in-flight speech/LLM when we have real transcript.
-            # (Previously cancel only ran when NOT speaking → old TTS kept playing.)
-            if try_barge_in and _allows_barge_in(text):
-                await interrupt_agent("speech_final", force=True)
-
             if reason != "ok":
+                # Resume soft-muted audio if STT was garbage (false VAD).
+                audio_drop_until["t"] = 0.0
                 logger.info(f"STT rejected ({reason}): text={text!r}")
                 return False
 
             if not _allows_turn(score, _turn_confidence_floor(text, stt_min_confidence)):
+                audio_drop_until["t"] = 0.0
                 logger.info(
                     f"STT rejected (low_confidence): score={score} text={text!r}")
                 return False
+
+            # Drop duplicate finals (speech_final + UtteranceEnd of same text).
+            norm = re.sub(r"\s+", " ", text.strip().lower())
+            now = time.monotonic()
+            if norm == last_utt["text"] and (now - last_utt["t"]) < 1.2:
+                logger.info(f"STT deduped: {text!r}")
+                return False
+            last_utt["text"] = norm
+            last_utt["t"] = now
 
             prev_lang = customer_lang["v"]
             customer_lang["v"] = _update_customer_language(text, customer_lang["v"])
@@ -665,8 +702,8 @@ class VoiceAgent:
                 customer_lang["hint_sent"] = False
                 logger.info(f"Customer language updated: {customer_lang['v']}")
 
-            # Always stop leftover agent turn before queueing the user's reply.
-            await interrupt_agent("new_utterance", force=True)
+            if try_barge_in:
+                await interrupt_agent("speech_final", force=True)
 
             await emit({"type": "user", "text": text})
             await emit({"type": "turn_complete"})
@@ -886,6 +923,9 @@ class VoiceAgent:
             return tts["ws"]
 
         async def _emit_audio(pcm):
+            # Soft-mute: drop PCM while caller may be speaking (SpeechStarted).
+            if time.monotonic() < audio_drop_until["t"]:
+                return
             # Mark speaking only when PCM actually leaves — never while waiting
             # on the TTS lock (that caused false barge-ins canceling the greeting).
             if not speaking["on"]:
@@ -894,6 +934,8 @@ class VoiceAgent:
             # Send in ~60ms chunks so barge-in cancellation is responsive.
             step = int(TTS_SAMPLE_RATE * 2 * 0.06)
             for i in range(0, len(pcm), step):
+                if time.monotonic() < audio_drop_until["t"]:
+                    return
                 if inspect.iscoroutinefunction(audio_output_callback):
                     await audio_output_callback(pcm[i:i + step])
                 else:
@@ -954,8 +996,17 @@ class VoiceAgent:
                             except (asyncio.CancelledError, Exception):
                                 pass
             except asyncio.CancelledError:
-                # Barge-in: drop the socket so the next turn starts clean.
+                # Close dirty mid-stream socket, rewarm in background during LLM time.
+                speaking["on"] = False
+                keep_lang = tts.get("lang")
                 await _close_tts()
+                if keep_lang:
+                    async def _rewarm():
+                        try:
+                            await _ensure_tts(keep_lang)
+                        except Exception:
+                            pass
+                    asyncio.create_task(_rewarm())
                 raise
             except Exception:
                 await _close_tts()
@@ -1105,6 +1156,8 @@ class VoiceAgent:
         async def run_turn(user_text):
             barge_in_ok["v"] = True
             agent_busy["v"] = True
+            reply_guard_until["t"] = time.monotonic() + REPLY_GUARD_S
+            audio_drop_until["t"] = 0.0
             try:
                 if not customer_lang["hint_sent"]:
                     messages.append({

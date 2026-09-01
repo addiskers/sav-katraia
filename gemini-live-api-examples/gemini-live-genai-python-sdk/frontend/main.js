@@ -49,13 +49,26 @@ const sarvamClient = new SarvamClient({
       `Hi, I have picked up the phone. Please start the call.`
     );
 
-    // Auto-start mic
-    startMic();
+    // Delay mic until greeting text arrives so ambient noise / early speech
+    // cannot barge-in-cancel the opening line before TTS starts.
+    // Fallback: open mic after 2.5s even if greeting is slow.
+    let micStarted = false;
+    const startMicOnce = () => {
+      if (micStarted) return;
+      micStarted = true;
+      startMic();
+    };
+    window.__startMicAfterGreeting = startMicOnce;
+    setTimeout(startMicOnce, 2500);
   },
   onMessage: (event) => {
     if (typeof event.data === "string") {
       try {
         const msg = JSON.parse(event.data);
+        if (msg.type === "agent" && window.__startMicAfterGreeting) {
+          window.__startMicAfterGreeting();
+          window.__startMicAfterGreeting = null;
+        }
         handleJsonMessage(msg);
       } catch (e) {
         console.error("Parse error:", e);

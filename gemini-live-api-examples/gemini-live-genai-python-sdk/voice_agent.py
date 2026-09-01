@@ -326,6 +326,8 @@ class VoiceAgent:
         speaking = {"on": False}       # agent audio is being sent out right now
         current_turn = {"task": None}  # in-flight agent turn task
         greeted = {"done": False}
+        tts_lock = asyncio.Lock()      # one Sarvam WS speaker at a time
+
 
         async def emit(event):
             await event_queue.put(event)
@@ -684,29 +686,30 @@ class VoiceAgent:
 
         async def _synth_to_pcm(text, lang="hi-IN"):
             """One-shot synthesize via the shared WS; return raw PCM bytes."""
-            ws = await _ensure_tts(lang)
-            await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
-            await ws.send(json.dumps({"type": "flush"}))
-            parts = []
-            async for raw in ws:
-                if isinstance(raw, bytes):
-                    continue
-                msg = json.loads(raw)
-                mtype = msg.get("type")
-                if mtype == "audio":
-                    audio_b64 = (msg.get("data") or {}).get("audio")
-                    if audio_b64:
-                        parts.append(_strip_wav_header(base64.b64decode(audio_b64)))
-                elif mtype == "event":
-                    if (msg.get("data") or {}).get("event_type") == "final":
-                        break
-                elif mtype == "error":
-                    err = (msg.get("data") or {}).get("message") or str(msg)
-                    raise RuntimeError(f"Sarvam TTS WS error: {err}")
-            pcm = b"".join(parts)
-            if pcm:
-                await emit({"type": "usage", "tts_chars": len(text)})
-            return pcm
+            async with tts_lock:
+                ws = await _ensure_tts(lang)
+                await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+                await ws.send(json.dumps({"type": "flush"}))
+                parts = []
+                async for raw in ws:
+                    if isinstance(raw, bytes):
+                        continue
+                    msg = json.loads(raw)
+                    mtype = msg.get("type")
+                    if mtype == "audio":
+                        audio_b64 = (msg.get("data") or {}).get("audio")
+                        if audio_b64:
+                            parts.append(_strip_wav_header(base64.b64decode(audio_b64)))
+                    elif mtype == "event":
+                        if (msg.get("data") or {}).get("event_type") == "final":
+                            break
+                    elif mtype == "error":
+                        err = (msg.get("data") or {}).get("message") or str(msg)
+                        raise RuntimeError(f"Sarvam TTS WS error: {err}")
+                pcm = b"".join(parts)
+                if pcm:
+                    await emit({"type": "usage", "tts_chars": len(text)})
+                return pcm
 
         async def _emit_audio(pcm):
             # Send in ~60ms chunks so barge-in cancellation is responsive.
@@ -725,51 +728,52 @@ class VoiceAgent:
             """
             chars_sent = 0
             try:
-                ws = await _ensure_tts(lang)
+                async with tts_lock:
+                    ws = await _ensure_tts(lang)
 
-                async def sender():
-                    nonlocal chars_sent
-                    while True:
-                        sentence = await sentence_queue.get()
-                        if sentence is None:
-                            await ws.send(json.dumps({"type": "flush"}))
-                            return
-                        if not sentence.strip():
-                            continue
-                        chars_sent += len(sentence)
-                        await ws.send(json.dumps({
-                            "type": "text",
-                            "data": {"text": sentence},
-                        }))
-
-                send_task = asyncio.create_task(sender())
-                try:
-                    async for raw in ws:
-                        if isinstance(raw, bytes):
-                            continue
-                        msg = json.loads(raw)
-                        mtype = msg.get("type")
-                        if mtype == "audio":
-                            audio_b64 = (msg.get("data") or {}).get("audio")
-                            if not audio_b64:
+                    async def sender():
+                        nonlocal chars_sent
+                        while True:
+                            sentence = await sentence_queue.get()
+                            if sentence is None:
+                                await ws.send(json.dumps({"type": "flush"}))
+                                return
+                            if not sentence.strip():
                                 continue
-                            pcm = _strip_wav_header(base64.b64decode(audio_b64))
-                            if pcm:
-                                await _emit_audio(pcm)
-                        elif mtype == "event":
-                            et = (msg.get("data") or {}).get("event_type")
-                            if et == "final":
-                                break
-                        elif mtype == "error":
-                            err = (msg.get("data") or {}).get("message") or str(msg)
-                            raise RuntimeError(f"Sarvam TTS WS error: {err}")
-                finally:
-                    if not send_task.done():
-                        send_task.cancel()
-                        try:
-                            await send_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                            chars_sent += len(sentence)
+                            await ws.send(json.dumps({
+                                "type": "text",
+                                "data": {"text": sentence},
+                            }))
+
+                    send_task = asyncio.create_task(sender())
+                    try:
+                        async for raw in ws:
+                            if isinstance(raw, bytes):
+                                continue
+                            msg = json.loads(raw)
+                            mtype = msg.get("type")
+                            if mtype == "audio":
+                                audio_b64 = (msg.get("data") or {}).get("audio")
+                                if not audio_b64:
+                                    continue
+                                pcm = _strip_wav_header(base64.b64decode(audio_b64))
+                                if pcm:
+                                    await _emit_audio(pcm)
+                            elif mtype == "event":
+                                et = (msg.get("data") or {}).get("event_type")
+                                if et == "final":
+                                    break
+                            elif mtype == "error":
+                                err = (msg.get("data") or {}).get("message") or str(msg)
+                                raise RuntimeError(f"Sarvam TTS WS error: {err}")
+                    finally:
+                        if not send_task.done():
+                            send_task.cancel()
+                            try:
+                                await send_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
             except asyncio.CancelledError:
                 # Barge-in: drop the socket so the next turn starts clean.
                 await _close_tts()
@@ -873,7 +877,9 @@ class VoiceAgent:
 
         # ---- greeting shortcut (skip 2 LLM roundtrips on call start) -------
         async def run_greeting():
-            speaking["on"] = True
+            # IMPORTANT: do NOT set speaking["on"] until TTS actually starts.
+            # Browser mic is already open; early speaking=True lets Deepgram
+            # SpeechStarted cancel the greeting before any audio plays.
             try:
                 if vehicle_prefetch["done"] and vehicle_prefetch["data"] is not None:
                     vehicle = vehicle_prefetch["data"]
@@ -922,10 +928,18 @@ class VoiceAgent:
                 messages.append({"role": "assistant", "content": full})
 
                 await emit({"type": "agent", "text": full})
-                await speak_text(full, lang="hi-IN")
+                speaking["on"] = True
+                try:
+                    await speak_text(full, lang="hi-IN")
+                finally:
+                    speaking["on"] = False
                 await emit({"type": "turn_complete"})
-            finally:
+            except asyncio.CancelledError:
                 speaking["on"] = False
+                raise
+            except Exception:
+                speaking["on"] = False
+                raise
 
         # ---- one agent turn: LLM (+tools) then TTS, all streamed ------------
         async def run_turn(user_text):

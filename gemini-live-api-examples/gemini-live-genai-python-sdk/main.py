@@ -163,7 +163,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 pass
 
     async def audio_interrupt_callback():
-        pass
+        # Flush browser audio immediately — don't wait for the event-queue round-trip.
+        if not client_disconnected:
+            try:
+                await websocket.send_json({"type": "interrupted"})
+            except Exception:
+                pass
 
     agent_client = VoiceAgent(
         model=MODEL,

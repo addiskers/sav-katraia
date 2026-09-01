@@ -100,7 +100,8 @@ def get_system_instruction():
         f"unless customer clearly uses Gujarati script or sustained English. Never romanize "
         f"Hindi/Gujarati. 1–2 short sentences per turn; one step then wait. Never narrate "
         f"reasoning or stage directions.\n"
-        f"FORBIDDEN: generic English help-desk lines like 'How can I help/assist you today'. "
+        f"FORBIDDEN: help-desk filler in any language "
+        f"('How can I help/assist you today', 'मैं आपकी कैसे मदद कर सकता हूँ'). "
         f"You know why you called — their Maruti service is due. Stay on the service flow.\n"
         f"DATES: Today {today.strftime('%Y-%m-%d')} ({today.strftime('%A')}); "
         f"kal/tomorrow={tomorrow.strftime('%Y-%m-%d')}; "
@@ -486,24 +487,31 @@ class VoiceAgent:
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
         barge_in_ok = {"v": False}
-        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.5"))
+        # Grace only for VAD SpeechStarted (echo protection). Real transcripts force-cancel.
+        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.35"))
 
 
         async def emit(event):
             await event_queue.put(event)
 
         # ---- barge-in -------------------------------------------------------
-        async def interrupt_agent(reason="speech"):
+        async def interrupt_agent(reason="speech", *, force=False):
+            """Cancel the in-flight agent turn and flush client audio.
+
+            force=True: skip echo grace (use when Deepgram has real transcript text).
+            force=False: apply grace window (SpeechStarted VAD can be TTS echo).
+            """
             if not barge_in_ok["v"]:
-                return
+                return False
             task = current_turn["task"]
             if not task or task.done() or not agent_busy["v"]:
-                return
-            # Echo guard applies only while TTS audio is actively playing.
-            if speaking["on"]:
+                return False
+            if not force and speaking["on"]:
                 if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
-                    return
-            logger.info(f"Barge-in ({reason})")
+                    return False
+            logger.info(f"Barge-in ({reason}, force={force})")
+            speaking["on"] = False
+            agent_busy["v"] = False
             task.cancel()
             if audio_interrupt_callback:
                 if inspect.iscoroutinefunction(audio_interrupt_callback):
@@ -511,6 +519,7 @@ class VoiceAgent:
                 else:
                     audio_interrupt_callback()
             await emit({"type": "interrupted"})
+            return True
 
         # ---- Deepgram STT: stream caller audio, receive transcripts ---------
         async def stt_loop():
@@ -571,16 +580,19 @@ class VoiceAgent:
                                 mtype = msg.get("type")
 
                                 if mtype == "SpeechStarted":
-                                    # Fast barge-in while agent TTS is playing
-                                    # (not during LLM-only phase — avoids noise false triggers).
+                                    # Fast VAD barge-in while TTS is playing (grace applies).
                                     if speaking["on"]:
-                                        await interrupt_agent("SpeechStarted")
+                                        await interrupt_agent("SpeechStarted", force=False)
                                 elif mtype == "Results":
                                     alt = (((msg.get("channel") or {}).get("alternatives")
                                             or [{}])[0])
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
+                                    # Interim text while agent speaks → stop after echo grace
+                                    # (force=False). Final transcripts force-cancel immediately.
+                                    if speaking["on"] and _allows_barge_in(text):
+                                        await interrupt_agent("interim", force=False)
                                     if msg.get("is_final"):
                                         pending_final.append({
                                             "text": text,
@@ -592,7 +604,8 @@ class VoiceAgent:
                                                 pending_final, try_barge_in=True)
                                             pending_final = []
                                 elif mtype == "UtteranceEnd":
-                                    await _finish_utterance(pending_final)
+                                    await _finish_utterance(
+                                        pending_final, try_barge_in=True)
                                     pending_final = []
                         finally:
                             pump.cancel()
@@ -632,9 +645,10 @@ class VoiceAgent:
 
             score, reason = _utterance_confidence(text, alt_confidence, all_words)
 
-            # Barge-in: any structurally valid speech (incl. short "suno"/"hello").
+            # Force-cancel any in-flight speech/LLM when we have real transcript.
+            # (Previously cancel only ran when NOT speaking → old TTS kept playing.)
             if try_barge_in and _allows_barge_in(text):
-                await interrupt_agent("speech_final")
+                await interrupt_agent("speech_final", force=True)
 
             if reason != "ok":
                 logger.info(f"STT rejected ({reason}): text={text!r}")
@@ -651,12 +665,11 @@ class VoiceAgent:
                 customer_lang["hint_sent"] = False
                 logger.info(f"Customer language updated: {customer_lang['v']}")
 
+            # Always stop leftover agent turn before queueing the user's reply.
+            await interrupt_agent("new_utterance", force=True)
+
             await emit({"type": "user", "text": text})
             await emit({"type": "turn_complete"})
-            # Stale in-flight (not yet speaking) reply -> cancel; merged turn re-runs.
-            task = current_turn["task"]
-            if task and not task.done() and not speaking["on"]:
-                task.cancel()
             await turn_queue.put(text)
             return True
 

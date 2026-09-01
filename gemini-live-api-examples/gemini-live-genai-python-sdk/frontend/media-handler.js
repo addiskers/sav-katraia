@@ -238,6 +238,14 @@ class MediaHandler {
   stopAudioPlayback() {
     // Mute playback to drop any audio chunks still in-flight from server
     this.playbackMuted = true;
+    if (this.outputGain) {
+      try {
+        this.outputGain.gain.cancelScheduledValues(this.audioContext.currentTime);
+        this.outputGain.gain.setValueAtTime(0, this.audioContext.currentTime);
+      } catch (e) {
+        this.outputGain.gain.value = 0;
+      }
+    }
 
     this.scheduledSources.forEach((s) => {
       try {
@@ -251,9 +259,17 @@ class MediaHandler {
     }
 
     // Un-mute after a short delay so new (post-interrupt) audio can play
-    setTimeout(() => {
+    clearTimeout(this._unmuteTimer);
+    this._unmuteTimer = setTimeout(() => {
       this.playbackMuted = false;
-    }, 300);
+      if (this.outputGain) {
+        try {
+          this.outputGain.gain.setValueAtTime(1, this.audioContext.currentTime);
+        } catch (e) {
+          this.outputGain.gain.value = 1;
+        }
+      }
+    }, 600);
   }
 
   getInputAnalyser() {

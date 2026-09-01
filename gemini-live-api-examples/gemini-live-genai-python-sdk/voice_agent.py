@@ -231,17 +231,29 @@ def _first_name(owner_name: str) -> str:
 _GARBAGE_PUNCT_RE = re.compile(r"[¿¡]")
 _GARBAGE_ACCENT_RE = re.compile(
     r"[àáâãäåæçèéêëìíîïñòóôõöùúûüýÿ]", re.I)
+# Punctuation that should not count against speech-content ratio.
+_NEUTRAL_PUNCT = frozenset(".,!?;:'\"()-…")
 
 
-def _letter_ratio(text: str) -> float:
-    if not text:
+def _is_speech_char(ch: str) -> bool:
+    """True for letters in any script (incl. Indic matras Deepgram emits)."""
+    if not ch or ch.isspace() or ch in _NEUTRAL_PUNCT:
+        return False
+    o = ord(ch)
+    if 0x0900 <= o <= 0x097F:   # Devanagari
+        return True
+    if 0x0A80 <= o <= 0x0AFF:   # Gujarati
+        return True
+    return ch.isalpha() or ch.isdigit()
+
+
+def _speech_char_ratio(text: str) -> float:
+    """Share of chars that look like speech, not whitespace/punctuation."""
+    stripped = (text or "").strip()
+    if not stripped:
         return 0.0
-    letters = sum(1 for ch in text if ch.isalpha())
-    return letters / len(text)
-
-
-def _utterance_word_count(text: str) -> int:
-    return len([w for w in re.split(r"\s+", (text or "").strip()) if w])
+    speech = sum(1 for ch in stripped if _is_speech_char(ch))
+    return speech / len(stripped)
 
 
 def _median_word_confidence(words) -> float | None:
@@ -255,42 +267,45 @@ def _median_word_confidence(words) -> float | None:
     return float(statistics.median(confs))
 
 
-def _utterance_quality(text, confidence=None, words=None):
-    """Score a finalized STT utterance. Returns (score, reason) or (None, reason)."""
+def _utterance_structure_ok(text: str):
+    """Language-agnostic shape check. Returns (ok, reason)."""
     text = (text or "").strip()
     if not text:
-        return None, "empty"
+        return False, "empty"
 
-    min_letter_ratio = _env_float("STT_MIN_LETTER_RATIO", 0.40)
-    if _letter_ratio(text) < min_letter_ratio:
-        return None, "low_letter_ratio"
+    min_ratio = _env_float("STT_MIN_LETTER_RATIO", 0.30)
+    if _speech_char_ratio(text) < min_ratio:
+        return False, "low_letter_ratio"
 
     if _GARBAGE_PUNCT_RE.search(text) or _GARBAGE_ACCENT_RE.search(text):
-        return None, "garbage_punctuation"
+        return False, "garbage_punctuation"
+
+    return True, "ok"
+
+
+def _utterance_confidence(text, confidence=None, words=None):
+    """Confidence score when structure is OK; None if structure fails."""
+    ok, reason = _utterance_structure_ok(text)
+    if not ok:
+        return None, reason
 
     word_conf = _median_word_confidence(words)
     if word_conf is not None:
-        score = word_conf
-    elif confidence is not None:
-        score = float(confidence)
-    else:
-        # No confidence from Deepgram — fall back to structural signal only.
-        score = 0.75 if _letter_ratio(text) >= 0.55 else 0.55
-
-    return score, "ok"
+        return word_conf, "ok"
+    if confidence is not None:
+        return float(confidence), "ok"
+    # Deepgram omitted scores — trust structural pass.
+    return 0.55, "ok"
 
 
 def _allows_turn(score, min_confidence):
     return score is not None and score >= min_confidence
 
 
-def _allows_barge_in(score, word_count, min_confidence, min_words):
-    if score is None or score < min_confidence:
-        return False
-    if word_count >= min_words:
-        return True
-    # Single-word barge-in only when Deepgram is very confident.
-    return score >= _env_float("STT_BARGE_IN_HIGH_CONF", 0.85)
+def _allows_barge_in(text: str) -> bool:
+    """Interrupt on any non-garbage utterance — short 'suno'/'hello' included."""
+    ok, _ = _utterance_structure_ok(text)
+    return ok
 
 
 def _resolve_llm_config():
@@ -373,9 +388,7 @@ class VoiceAgent:
         stt_endpointing_ms = os.getenv("DEEPGRAM_ENDPOINTING_MS", "450")
         stt_utterance_end_ms = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1500")
         turn_debounce = _env_float("TURN_DEBOUNCE", 0.15)
-        stt_min_confidence = _env_float("STT_MIN_CONFIDENCE", 0.62)
-        stt_barge_in_min_confidence = _env_float("STT_BARGE_IN_MIN_CONFIDENCE", 0.72)
-        stt_barge_in_min_words = int(_env_float("STT_BARGE_IN_MIN_WORDS", 2))
+        stt_min_confidence = _env_float("STT_MIN_CONFIDENCE", 0.45)
         use_openrouter = "openrouter.ai" in llm_chat_url
 
         try:
@@ -546,16 +559,20 @@ class VoiceAgent:
                 float(statistics.median(confidences)) if confidences else None
             )
 
-            score, reason = _utterance_quality(text, alt_confidence, all_words)
-            if not _allows_turn(score, stt_min_confidence):
-                logger.info(
-                    f"STT rejected ({reason}): score={score} text={text!r}")
+            score, reason = _utterance_confidence(text, alt_confidence, all_words)
+
+            # Barge-in: any structurally valid speech (incl. short "suno"/"hello").
+            if try_barge_in and _allows_barge_in(text):
+                await interrupt_agent("speech_final")
+
+            if reason != "ok":
+                logger.info(f"STT rejected ({reason}): text={text!r}")
                 return False
 
-            wc = _utterance_word_count(text)
-            if try_barge_in and _allows_barge_in(
-                    score, wc, stt_barge_in_min_confidence, stt_barge_in_min_words):
-                await interrupt_agent("speech_final")
+            if not _allows_turn(score, stt_min_confidence):
+                logger.info(
+                    f"STT rejected (low_confidence): score={score} text={text!r}")
+                return False
 
             if customer_lang["v"] is None:
                 customer_lang["v"] = _tts_language_for(text)

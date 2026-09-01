@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -101,6 +102,8 @@ def get_system_instruction():
         f"(today+0–14d only). Never use warranty/purchase/service-history dates.\n"
         f"LANGUAGE: open Hindi; after customer's first reply switch fully to their "
         f"language (en/gu/mr/hi) and stay. Never mix.\n"
+        f"ACK: if customer only acknowledges (short yes/ok/go ahead), proceed directly to "
+        f"step 2 (vehicle+service+pickup); do not ask which language they prefer.\n"
         f"FLOW (wait after each): (1) name vehicle+service due (2) offer free pickup/drop "
         f"(3) confirm address (4) ask day/time (5) MUST call schedule_pickup when all "
         f"confirmed (6) share booking ID/driver (7) warm close. Call get_vehicle_info at "
@@ -225,6 +228,71 @@ def _first_name(owner_name: str) -> str:
     return name.split()[0]
 
 
+_GARBAGE_PUNCT_RE = re.compile(r"[¿¡]")
+_GARBAGE_ACCENT_RE = re.compile(
+    r"[àáâãäåæçèéêëìíîïñòóôõöùúûüýÿ]", re.I)
+
+
+def _letter_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    letters = sum(1 for ch in text if ch.isalpha())
+    return letters / len(text)
+
+
+def _utterance_word_count(text: str) -> int:
+    return len([w for w in re.split(r"\s+", (text or "").strip()) if w])
+
+
+def _median_word_confidence(words) -> float | None:
+    confs = [
+        float(w["confidence"])
+        for w in (words or [])
+        if w.get("confidence") is not None
+    ]
+    if not confs:
+        return None
+    return float(statistics.median(confs))
+
+
+def _utterance_quality(text, confidence=None, words=None):
+    """Score a finalized STT utterance. Returns (score, reason) or (None, reason)."""
+    text = (text or "").strip()
+    if not text:
+        return None, "empty"
+
+    min_letter_ratio = _env_float("STT_MIN_LETTER_RATIO", 0.40)
+    if _letter_ratio(text) < min_letter_ratio:
+        return None, "low_letter_ratio"
+
+    if _GARBAGE_PUNCT_RE.search(text) or _GARBAGE_ACCENT_RE.search(text):
+        return None, "garbage_punctuation"
+
+    word_conf = _median_word_confidence(words)
+    if word_conf is not None:
+        score = word_conf
+    elif confidence is not None:
+        score = float(confidence)
+    else:
+        # No confidence from Deepgram — fall back to structural signal only.
+        score = 0.75 if _letter_ratio(text) >= 0.55 else 0.55
+
+    return score, "ok"
+
+
+def _allows_turn(score, min_confidence):
+    return score is not None and score >= min_confidence
+
+
+def _allows_barge_in(score, word_count, min_confidence, min_words):
+    if score is None or score < min_confidence:
+        return False
+    if word_count >= min_words:
+        return True
+    # Single-word barge-in only when Deepgram is very confident.
+    return score >= _env_float("STT_BARGE_IN_HIGH_CONF", 0.85)
+
+
 def _resolve_llm_config():
     """Prefer OpenRouter (LLM_*/OPENROUTER_*); fall back to Groq as a set.
 
@@ -302,9 +370,12 @@ class VoiceAgent:
         sarvam_key = os.getenv("SARVAM_API_KEY", "")
         stt_model = os.getenv("DEEPGRAM_MODEL", STT_MODEL)
         stt_language = os.getenv("DEEPGRAM_LANGUAGE", STT_LANGUAGE)
-        stt_endpointing_ms = os.getenv("DEEPGRAM_ENDPOINTING_MS", "250")
-        stt_utterance_end_ms = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000")
+        stt_endpointing_ms = os.getenv("DEEPGRAM_ENDPOINTING_MS", "450")
+        stt_utterance_end_ms = os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1500")
         turn_debounce = _env_float("TURN_DEBOUNCE", 0.15)
+        stt_min_confidence = _env_float("STT_MIN_CONFIDENCE", 0.62)
+        stt_barge_in_min_confidence = _env_float("STT_BARGE_IN_MIN_CONFIDENCE", 0.72)
+        stt_barge_in_min_words = int(_env_float("STT_BARGE_IN_MIN_WORDS", 2))
         use_openrouter = "openrouter.ai" in llm_chat_url
 
         try:
@@ -328,11 +399,12 @@ class VoiceAgent:
         speaking_since = {"t": 0.0}    # monotonic time when current audio began
         current_turn = {"task": None}  # in-flight agent turn task
         greeted = {"done": False}
+        customer_lang = {"v": None, "hint_sent": False}
         tts_lock = asyncio.Lock()      # one Sarvam WS speaker at a time
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
         barge_in_ok = {"v": False}
-        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.75"))
+        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "1.25"))
 
 
         async def emit(event):
@@ -371,6 +443,7 @@ class VoiceAgent:
                 "endpointing": stt_endpointing_ms,
                 "utterance_end_ms": stt_utterance_end_ms,
                 "vad_events": "true",
+                "filler_words": "false",
             }
             url = f"{DEEPGRAM_WS_URL}?{urlencode(params)}"
             headers = {"Authorization": f"Token {deepgram_key}"}
@@ -415,23 +488,24 @@ class VoiceAgent:
                                 mtype = msg.get("type")
 
                                 if mtype == "SpeechStarted":
-                                    # Fastest barge-in signal (~100-300ms): the
-                                    # caller began speaking. Stop the agent NOW.
-                                    await interrupt_agent("SpeechStarted")
+                                    # Do not barge-in on VAD alone — minor bg noise
+                                    # was stopping the agent mid-sentence.
+                                    pass
                                 elif mtype == "Results":
                                     alt = (((msg.get("channel") or {}).get("alternatives")
                                             or [{}])[0])
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
-                                    # Only barge-in on solid finals — interim
-                                    # Results are often TTS echo bleeding into the mic.
-                                    if msg.get("is_final") and msg.get("speech_final"):
-                                        await interrupt_agent("speech_final")
                                     if msg.get("is_final"):
-                                        pending_final.append(text)
+                                        pending_final.append({
+                                            "text": text,
+                                            "confidence": alt.get("confidence"),
+                                            "words": alt.get("words") or [],
+                                        })
                                         if msg.get("speech_final"):
-                                            await _finish_utterance(pending_final)
+                                            await _finish_utterance(
+                                                pending_final, try_barge_in=True)
                                             pending_final = []
                                 elif mtype == "UtteranceEnd":
                                     await _finish_utterance(pending_final)
@@ -452,10 +526,41 @@ class VoiceAgent:
                         return
                     await asyncio.sleep(min(2 ** failures, 8))
 
-        async def _finish_utterance(segments):
-            text = " ".join(s for s in segments if s).strip()
+        async def _finish_utterance(segments, *, try_barge_in=False):
+            text = " ".join(
+                (s.get("text") if isinstance(s, dict) else s)
+                for s in segments if s
+            ).strip()
             if not text:
-                return
+                return False
+
+            all_words = []
+            confidences = []
+            for seg in segments:
+                if not isinstance(seg, dict):
+                    continue
+                all_words.extend(seg.get("words") or [])
+                if seg.get("confidence") is not None:
+                    confidences.append(float(seg["confidence"]))
+            alt_confidence = (
+                float(statistics.median(confidences)) if confidences else None
+            )
+
+            score, reason = _utterance_quality(text, alt_confidence, all_words)
+            if not _allows_turn(score, stt_min_confidence):
+                logger.info(
+                    f"STT rejected ({reason}): score={score} text={text!r}")
+                return False
+
+            wc = _utterance_word_count(text)
+            if try_barge_in and _allows_barge_in(
+                    score, wc, stt_barge_in_min_confidence, stt_barge_in_min_words):
+                await interrupt_agent("speech_final")
+
+            if customer_lang["v"] is None:
+                customer_lang["v"] = _tts_language_for(text)
+                logger.info(f"Customer language locked: {customer_lang['v']}")
+
             await emit({"type": "user", "text": text})
             await emit({"type": "turn_complete"})
             # Stale in-flight (not yet speaking) reply -> cancel; merged turn re-runs.
@@ -463,6 +568,7 @@ class VoiceAgent:
             if task and not task.done() and not speaking["on"]:
                 task.cancel()
             await turn_queue.put(text)
+            return True
 
         # ---- text inputs (browser text box / Twilio call trigger) -----------
         async def text_loop():
@@ -535,24 +641,6 @@ class VoiceAgent:
                             if idx >= 0 else ""
                         )
                         continue
-                    # Early first-audio: don't wait for a full sentence — flush
-                    # ~25 chars at a word/clause break so TTS starts while LLM
-                    # is still generating (R&D: ~200-300ms earlier first audio).
-                    if not emitted_any and len(pending) >= 25:
-                        break_at = -1
-                        for sep in ("।", "!", "?", ".", ",", " "):
-                            pos = pending.rfind(sep)
-                            if pos > break_at:
-                                break_at = pos
-                        if break_at >= 15:
-                            if pending[break_at] in "।!?,.":
-                                first = pending[: break_at + 1].strip()
-                            else:
-                                first = pending[:break_at].strip()
-                            if first:
-                                await on_sentence(first)
-                                emitted_any = True
-                                pending = pending[len(first):].lstrip(" ,।")
                     return
             for attempt in range(4):
                 try:
@@ -907,19 +995,37 @@ class VoiceAgent:
         # ---- one agent turn: LLM (+tools) then TTS, all streamed ------------
         async def run_turn(user_text):
             barge_in_ok["v"] = True
+            if customer_lang["v"] and not customer_lang["hint_sent"]:
+                lang_labels = {
+                    "hi-IN": "Hindi (Devanagari script)",
+                    "gu-IN": "Gujarati script",
+                    "en-IN": "English",
+                }
+                label = lang_labels.get(customer_lang["v"], customer_lang["v"])
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"Customer language is {label}. Reply ONLY in that "
+                        f"language/script for the rest of this call. Never mix."
+                    ),
+                })
+                customer_lang["hint_sent"] = True
+
             messages.append({"role": "user", "content": user_text})
+            turn_tts_lang = customer_lang["v"]
             for _ in range(5):  # tool-call loop guard
                 sentence_queue = asyncio.Queue()
                 agent_text_parts = []
                 started_speaking = {"v": False}
                 speak_task = None
-                speak_lang = {"v": None}
+                speak_lang = {"v": turn_tts_lang}
 
                 async def on_sentence(s):
                     nonlocal speak_task
                     if not started_speaking["v"]:
                         started_speaking["v"] = True
-                        speak_lang["v"] = _tts_language_for(s)
+                        if not speak_lang["v"]:
+                            speak_lang["v"] = _tts_language_for(s)
                         # speaking["on"] flips true inside _emit_audio (first PCM)
                         speak_task = asyncio.create_task(
                             speak_stream(sentence_queue, speak_lang["v"]))

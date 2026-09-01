@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import time
 import traceback
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -324,18 +325,30 @@ class VoiceAgent:
         messages = [{"role": "system", "content": get_system_instruction()}]
 
         speaking = {"on": False}       # agent audio is being sent out right now
+        speaking_since = {"t": 0.0}    # monotonic time when current audio began
         current_turn = {"task": None}  # in-flight agent turn task
         greeted = {"done": False}
         tts_lock = asyncio.Lock()      # one Sarvam WS speaker at a time
+        # Barge-in disabled during greeting / until first real audio plays.
+        # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
+        barge_in_ok = {"v": False}
+        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.75"))
 
 
         async def emit(event):
             await event_queue.put(event)
 
         # ---- barge-in -------------------------------------------------------
-        async def interrupt_agent():
+        async def interrupt_agent(reason="speech"):
+            if not barge_in_ok["v"] or not speaking["on"]:
+                return
+            # Mic often picks up the agent's own TTS → false barge-in.
+            # Ignore interruptions for a short grace window after audio starts.
+            if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
+                return
             task = current_turn["task"]
-            if task and not task.done() and speaking["on"]:
+            if task and not task.done():
+                logger.info(f"Barge-in ({reason})")
                 task.cancel()
                 if audio_interrupt_callback:
                     if inspect.iscoroutinefunction(audio_interrupt_callback):
@@ -404,17 +417,17 @@ class VoiceAgent:
                                 if mtype == "SpeechStarted":
                                     # Fastest barge-in signal (~100-300ms): the
                                     # caller began speaking. Stop the agent NOW.
-                                    if speaking["on"]:
-                                        await interrupt_agent()
+                                    await interrupt_agent("SpeechStarted")
                                 elif mtype == "Results":
                                     alt = (((msg.get("channel") or {}).get("alternatives")
                                             or [{}])[0])
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
-                                    # Backup barge-in in case SpeechStarted was missed.
-                                    if speaking["on"]:
-                                        await interrupt_agent()
+                                    # Only barge-in on solid finals — interim
+                                    # Results are often TTS echo bleeding into the mic.
+                                    if msg.get("is_final") and msg.get("speech_final"):
+                                        await interrupt_agent("speech_final")
                                     if msg.get("is_final"):
                                         pending_final.append(text)
                                         if msg.get("speech_final"):
@@ -627,9 +640,6 @@ class VoiceAgent:
 
         # ---- TTS helpers (session-scoped reusable WebSocket) ----------------
         tts = {"ws": None, "lang": None}
-        # Pre-synthesized PCM clips (filled during prewarm). Keys are stable
-        # phrase ids — used for ack-filler and zero-latency stock lines.
-        pcm_cache = {}
         vehicle_prefetch = {"data": None, "done": False}
 
         async def _close_tts():
@@ -684,34 +694,12 @@ class VoiceAgent:
                 tts["lang"] = lang
             return tts["ws"]
 
-        async def _synth_to_pcm(text, lang="hi-IN"):
-            """One-shot synthesize via the shared WS; return raw PCM bytes."""
-            async with tts_lock:
-                ws = await _ensure_tts(lang)
-                await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
-                await ws.send(json.dumps({"type": "flush"}))
-                parts = []
-                async for raw in ws:
-                    if isinstance(raw, bytes):
-                        continue
-                    msg = json.loads(raw)
-                    mtype = msg.get("type")
-                    if mtype == "audio":
-                        audio_b64 = (msg.get("data") or {}).get("audio")
-                        if audio_b64:
-                            parts.append(_strip_wav_header(base64.b64decode(audio_b64)))
-                    elif mtype == "event":
-                        if (msg.get("data") or {}).get("event_type") == "final":
-                            break
-                    elif mtype == "error":
-                        err = (msg.get("data") or {}).get("message") or str(msg)
-                        raise RuntimeError(f"Sarvam TTS WS error: {err}")
-                pcm = b"".join(parts)
-                if pcm:
-                    await emit({"type": "usage", "tts_chars": len(text)})
-                return pcm
-
         async def _emit_audio(pcm):
+            # Mark speaking only when PCM actually leaves — never while waiting
+            # on the TTS lock (that caused false barge-ins canceling the greeting).
+            if not speaking["on"]:
+                speaking["on"] = True
+                speaking_since["t"] = time.monotonic()
             # Send in ~60ms chunks so barge-in cancellation is responsive.
             step = int(TTS_SAMPLE_RATE * 2 * 0.06)
             for i in range(0, len(pcm), step):
@@ -795,35 +783,13 @@ class VoiceAgent:
             for chunk in _split_sentences(text):
                 await sentence_queue.put(chunk)
             await sentence_queue.put(None)
-            await speak_task
-
-        async def play_ack_filler(started_speaking):
-            """If LLM is slow (>200ms), play a cached 'हाँ' to mask dead air.
-
-            Cancelled as soon as the real reply starts so audio never overlaps.
-            """
             try:
-                await asyncio.sleep(0.20)
-            except asyncio.CancelledError:
-                return
-            if started_speaking["v"]:
-                return
-            pcm = pcm_cache.get("haan")
-            if not pcm:
-                return
-            speaking["on"] = True
-            try:
-                await _emit_audio(pcm)
-            except asyncio.CancelledError:
-                if audio_interrupt_callback:
-                    if inspect.iscoroutinefunction(audio_interrupt_callback):
-                        await audio_interrupt_callback()
-                    else:
-                        audio_interrupt_callback()
-                raise
+                await speak_task
             finally:
-                if not started_speaking["v"]:
-                    speaking["on"] = False
+                speaking["on"] = False
+
+        # Ack filler removed — it caused users to only hear "हाँ" while real
+        # replies were barge-in-cancelled by TTS echo into the mic.
 
         # ---- connection prewarm --------------------------------------------
         async def prewarm_connections():
@@ -863,13 +829,10 @@ class VoiceAgent:
             except Exception as e:
                 logger.warning(f"LLM prewarm failed: {e}")
 
-            # Open Sarvam TTS WS + cache a short ack filler ("हाँ") for dead-air mask.
+            # Open Sarvam TTS WS only (no filler synth — that blocked greeting
+            # on the TTS lock and caused false barge-ins).
             try:
                 await _ensure_tts("hi-IN")
-                haan = await _synth_to_pcm("हाँ।", lang="hi-IN")
-                if haan:
-                    pcm_cache["haan"] = haan
-                    logger.info(f"Ack filler cached ({len(haan)} bytes PCM)")
                 logger.info("Sarvam TTS WebSocket prewarmed (reused for call)")
             except Exception as e:
                 logger.warning(f"Sarvam TTS prewarm failed: {e}")
@@ -877,9 +840,10 @@ class VoiceAgent:
 
         # ---- greeting shortcut (skip 2 LLM roundtrips on call start) -------
         async def run_greeting():
-            # IMPORTANT: do NOT set speaking["on"] until TTS actually starts.
-            # Browser mic is already open; early speaking=True lets Deepgram
-            # SpeechStarted cancel the greeting before any audio plays.
+            # No barge-in during greeting — browser mic / TTS lock wait used to
+            # cancel this before any audio played (logs: "interrupted by caller").
+            barge_in_ok["v"] = False
+            speaking["on"] = False
             try:
                 if vehicle_prefetch["done"] and vehicle_prefetch["data"] is not None:
                     vehicle = vehicle_prefetch["data"]
@@ -928,14 +892,13 @@ class VoiceAgent:
                 messages.append({"role": "assistant", "content": full})
 
                 await emit({"type": "agent", "text": full})
-                speaking["on"] = True
-                try:
-                    await speak_text(full, lang="hi-IN")
-                finally:
-                    speaking["on"] = False
+                await speak_text(full, lang="hi-IN")
+                greeted["done"] = True
+                barge_in_ok["v"] = True
                 await emit({"type": "turn_complete"})
             except asyncio.CancelledError:
                 speaking["on"] = False
+                # Allow a retry — do not leave greeted stuck True with no audio.
                 raise
             except Exception:
                 speaking["on"] = False
@@ -943,42 +906,21 @@ class VoiceAgent:
 
         # ---- one agent turn: LLM (+tools) then TTS, all streamed ------------
         async def run_turn(user_text):
+            barge_in_ok["v"] = True
             messages.append({"role": "user", "content": user_text})
-            for hop in range(5):  # tool-call loop guard
+            for _ in range(5):  # tool-call loop guard
                 sentence_queue = asyncio.Queue()
                 agent_text_parts = []
                 started_speaking = {"v": False}
                 speak_task = None
                 speak_lang = {"v": None}
-                # Ack filler only on the first hop of a user turn (masks LLM TTFT).
-                # Skipped on tool follow-up hops so we don't say "हाँ" mid-tool.
-                filler_task = (
-                    asyncio.create_task(play_ack_filler(started_speaking))
-                    if hop == 0 else None
-                )
-
-                async def stop_filler():
-                    if not filler_task or filler_task.done():
-                        return
-                    filler_task.cancel()
-                    try:
-                        await filler_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    if audio_interrupt_callback and speaking["on"]:
-                        if inspect.iscoroutinefunction(audio_interrupt_callback):
-                            await audio_interrupt_callback()
-                        else:
-                            audio_interrupt_callback()
-                        speaking["on"] = False
 
                 async def on_sentence(s):
                     nonlocal speak_task
-                    await stop_filler()
                     if not started_speaking["v"]:
                         started_speaking["v"] = True
-                        speaking["on"] = True
                         speak_lang["v"] = _tts_language_for(s)
+                        # speaking["on"] flips true inside _emit_audio (first PCM)
                         speak_task = asyncio.create_task(
                             speak_stream(sentence_queue, speak_lang["v"]))
                     agent_text_parts.append(s)
@@ -988,7 +930,6 @@ class VoiceAgent:
                 try:
                     reply = await chat_completion_stream(messages, on_sentence)
                 finally:
-                    await stop_filler()
                     if started_speaking["v"]:
                         await sentence_queue.put(None)  # end the audio stream
                         if speak_task:
@@ -1042,25 +983,30 @@ class VoiceAgent:
                     except asyncio.TimeoutError:
                         break
 
-                # First call-start trigger: skip LLM, greet immediately.
-                if (not greeted["done"]) and CALL_START_RE.search(user_text):
-                    greeted["done"] = True
+                # First turn: always run greeting until it succeeds.
+                # greeted["done"] is set inside run_greeting only on success.
+                if not greeted["done"]:
+                    if user_text and not CALL_START_RE.search(user_text):
+                        # Keep the real user utterance for after the greeting.
+                        await turn_queue.put(user_text)
                     current_turn["task"] = asyncio.create_task(run_greeting())
+                elif CALL_START_RE.search(user_text):
+                    continue  # ignore duplicate call-start triggers
                 else:
-                    if not greeted["done"]:
-                        greeted["done"] = True
                     current_turn["task"] = asyncio.create_task(run_turn(user_text))
 
                 try:
                     await current_turn["task"]
                 except asyncio.CancelledError:
                     logger.info("Agent turn interrupted by caller")
+                    speaking["on"] = False
                 except Exception as e:
                     logger.error(f"Agent turn failed: {type(e).__name__}: {e}\n"
                                  f"{traceback.format_exc()}")
                     await emit({"type": "error", "error": f"{type(e).__name__}: {e}"})
                 finally:
                     current_turn["task"] = None
+                    speaking["on"] = False
 
         tasks = [
             asyncio.create_task(stt_loop()),

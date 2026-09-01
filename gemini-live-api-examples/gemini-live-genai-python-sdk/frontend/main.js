@@ -325,9 +325,6 @@ function handleJsonMessage(msg) {
     currentAgentMessageDiv = null;
     currentUserMessageDiv = null;
   } else if (msg.type === "user") {
-    // Stop leftover agent audio as soon as a user turn is recognized
-    // (covers lag if "interrupted" arrived late or was missed).
-    mediaHandler.stopAudioPlayback();
     if (currentUserMessageDiv) {
       const textEl = currentUserMessageDiv.querySelector(".msg-text");
       if (textEl) textEl.textContent += msg.text;
@@ -457,7 +454,7 @@ connectBtn.onclick = async () => {
 async function startMic() {
   try {
     await mediaHandler.startAudio((data) => {
-      if (sarvamClient.isConnected()) {
+      if (sarvamClient.isConnected() && !mediaHandler.isMicGated()) {
         sarvamClient.send(data);
       }
     });

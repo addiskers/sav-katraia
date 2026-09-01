@@ -42,11 +42,12 @@ import re
 import statistics
 import time
 import traceback
-from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
 import websockets
+
+from system_prompt import build_system_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -85,40 +86,8 @@ def _env_float(name, default):
 
 
 def get_system_instruction():
-    # Keep this short — TTFT scales with prompt size (~250ms saved vs the old
-    # 3k-char prompt on Groq in our R&D bench).
-    today = datetime.now()
-    tomorrow = today + timedelta(days=1)
-    day_after = today + timedelta(days=2)
-    return (
-        f"You are Rahul (ONLY Rahul) at Kataria Automobiles (spell Kataria, never Katrina), "
-        f"Maruti Suzuki dealership, Ahmedabad. LIVE outbound service-reminder call.\n"
-        f"DEFAULT LANGUAGE: Hindi Devanagari. Customers speak Hindi or Gujarati. "
-        f"Only switch to English if the customer speaks several clear English sentences. "
-        f"Never switch to English for garbled STT or single words like hello/yes.\n"
-        f"OUTPUT: plain speech only (no markdown/bullets/emoji/parentheses). Hindi Devanagari "
-        f"unless customer clearly uses Gujarati script or sustained English. Never romanize "
-        f"Hindi/Gujarati. 1–2 short sentences per turn; one step then wait. Never narrate "
-        f"reasoning or stage directions.\n"
-        f"FORBIDDEN: help-desk filler in any language "
-        f"('How can I help/assist you today', 'मैं आपकी कैसे मदद कर सकता हूँ'). "
-        f"You know why you called — their Maruti service is due. Stay on the service flow.\n"
-        f"DATES: Today {today.strftime('%Y-%m-%d')} ({today.strftime('%A')}); "
-        f"kal/tomorrow={tomorrow.strftime('%Y-%m-%d')}; "
-        f"parso/day-after={day_after.strftime('%Y-%m-%d')}. Pickup dates are near-future "
-        f"(today+0–14d only). Never use warranty/purchase/service-history dates.\n"
-        f"LANGUAGE: open in Hindi. Switch to Gujarati only if customer uses Gujarati script. "
-        f"Switch to English only after sustained clear English — never from one short phrase.\n"
-        f"ACK: if customer only acknowledges (short yes/ok/go ahead), proceed directly to "
-        f"step 2 (vehicle+service+pickup); do not ask which language they prefer.\n"
-        f"LISTEN: if customer says suno/suniye/listen or sounds frustrated, stop repeating, "
-        f"apologize briefly, ask what they need — never ask the same question twice in a row.\n"
-        f"FLOW (wait after each): (1) name vehicle+service due (2) offer free pickup/drop "
-        f"(3) confirm address (4) ask day/time (5) MUST call schedule_pickup when all "
-        f"confirmed (6) share booking ID/driver (7) warm close. Call get_vehicle_info at "
-        f"start (never invent data); get_service_cost_estimate on price questions. If wrong "
-        f"car: discard data, apologize, ask name/Maruti status."
-    )
+    return build_system_instruction()
+
 
 # Tool declarations in OpenAI/Groq chat-completions format.
 TOOLS = [
@@ -207,6 +176,8 @@ def _tts_language_for(text: str) -> str:
     gu, dev, latin = _script_counts(text)
     if gu > dev and gu > latin:
         return "gu-IN"
+    if _looks_marathi(text):
+        return "mr-IN"
     if dev >= latin and dev > 0:
         return "hi-IN"
     if latin > 0:
@@ -214,22 +185,91 @@ def _tts_language_for(text: str) -> str:
     return DEFAULT_CALL_LANGUAGE
 
 
-def _update_customer_language(text: str, current: str, en_streak: dict | None = None) -> str:
-    """Switch reply/TTS language only on strong, reliable signals.
+_EXPLICIT_LANG_PATTERNS = (
+    (re.compile(r"(talk|speak)\s+in\s+english|english\s+me(in)?|in\s+english\b", re.I), "en-IN"),
+    (re.compile(r"gujarati\s+ma|gujarati\s+me|speak\s+gujarati|ગુજરાતી", re.I), "gu-IN"),
+    (re.compile(r"marathi\s+madhe|marathi\s+me|speak\s+marathi|मराठी", re.I), "mr-IN"),
+    (re.compile(r"hindi\s+me(in)?|speak\s+hindi|हिंदी\s+में", re.I), "hi-IN"),
+)
 
-    en_streak: optional {"n": int} — consecutive Latin-only turns. English
-    requires several clear English turns, not one noisy STT fragment.
-    """
+_MARATHI_MARKERS = re.compile(
+    r"ळ|आहे|नाही|होय|काय|मला|तुम्ही|नको|बरो|माझ|तुमच",
+    re.I,
+)
+
+# Short Latin acks — do not treat as English on first response (STT noise).
+_LATIN_ACKS = frozenset({
+    "hello", "hi", "hey", "yes", "yeah", "ok", "okay", "haan", "han", "ji",
+    "hmm", "hm", "speaking", "bolo", "boliye",
+})
+
+_INDIC_ACKS = frozenset({
+    "हां", "हाँ", "haan", "han", "ji", "जी", "bolo", "बोलो", "boliye", "बोलिए",
+    "theek", "ठीक", "ok", "okay", "yes", "hello", "hi", "ha", "hmm", "achha",
+    "अच्छा", "sahi", "सही",
+})
+
+
+def _resolve_explicit_language(text: str) -> str | None:
+    for pattern, lang in _EXPLICIT_LANG_PATTERNS:
+        if pattern.search(text or ""):
+            return lang
+    return None
+
+
+def _looks_marathi(text: str) -> bool:
+    return bool(_MARATHI_MARKERS.search(text or ""))
+
+
+def _looks_english_turn(text: str) -> bool:
+    gu, dev, latin = _script_counts(text)
+    if gu > 0 or dev > 0:
+        return False
+    words = [w.strip(".,!?").lower() for w in re.split(r"\s+", text.strip()) if w]
+    if not words:
+        return False
+    if all(w in _LATIN_ACKS for w in words):
+        return False
+    if len(words) >= 2 and latin >= len(words):
+        return True
+    return len(words) >= 3 and latin >= 2
+
+
+def _update_customer_language(
+    text: str,
+    current: str,
+    en_streak: dict | None = None,
+    *,
+    is_first_response: bool = False,
+) -> str:
+    """Update reply/TTS language from customer speech."""
+    explicit = _resolve_explicit_language(text)
+    if explicit:
+        if en_streak is not None:
+            en_streak["n"] = 0
+        return explicit
+
     gu, dev, latin = _script_counts(text)
     if gu > 2 and gu > dev:
         if en_streak is not None:
             en_streak["n"] = 0
         return "gu-IN"
+    if _looks_marathi(text):
+        if en_streak is not None:
+            en_streak["n"] = 0
+        return "mr-IN"
     if dev > 0:
         if en_streak is not None:
             en_streak["n"] = 0
         return "hi-IN"
+
     if latin > 0 and gu == 0 and dev == 0:
+        # Gemini prompt: auto-detect language on first customer response.
+        if is_first_response and _looks_english_turn(text):
+            if en_streak is not None:
+                en_streak["n"] = 0
+            return "en-IN"
+
         words = [w for w in re.split(r"\s+", text.strip()) if w]
         min_en_words = int(_env_float("ENGLISH_SWITCH_MIN_WORDS", 8))
         need_streak = int(_env_float("ENGLISH_SWITCH_STREAK", 2))
@@ -260,14 +300,16 @@ def _turn_confidence_floor(text: str, base_min: float) -> float:
 
 def _language_hint(lang_code: str) -> str:
     labels = {
-        "hi-IN": "Hindi (Devanagari script)",
-        "gu-IN": "Gujarati script",
-        "en-IN": "English",
+        "hi-IN": "Hindi/Hinglish (Devanagari script)",
+        "gu-IN": "Gujarati script only",
+        "mr-IN": "Marathi (Devanagari script)",
+        "en-IN": "English only",
     }
     label = labels.get(lang_code, lang_code)
     return (
-        f"Reply ONLY in {label} for this turn. Never mix scripts. "
-        f"Never use generic English help-desk phrases."
+        f"LANGUAGE LOCK: Reply ONLY in {label} for this turn and all following turns "
+        f"until the customer switches language. Never mix scripts or languages. "
+        f"Never use generic help-desk filler."
     )
 
 
@@ -378,10 +420,67 @@ def _allows_turn(score, min_confidence):
     return score is not None and score >= min_confidence
 
 
-def _allows_barge_in(text: str) -> bool:
-    """Interrupt on any non-garbage utterance — short 'suno'/'hello' included."""
+def _allows_barge_in(text: str, *, agent_speaking: bool, recent_agent: str) -> bool:
+    """Whether to interrupt the agent for this utterance."""
     ok, _ = _utterance_structure_ok(text)
-    return ok
+    if not ok:
+        return False
+    if not agent_speaking:
+        return True
+    if _is_echo_of_agent(text, recent_agent):
+        return False
+    if _is_ack_only(text):
+        return False
+    words = [w for w in re.split(r"\s+", text.strip()) if w]
+    if len(words) >= 3:
+        return True
+    if _has_interrupt_intent(text):
+        return True
+    return False
+
+
+def _normalize_echo_text(text: str) -> str:
+    return re.sub(r"[^\w\s]", " ", (text or "").lower())
+
+
+def _is_echo_of_agent(user_text: str, agent_text: str) -> bool:
+    """Reject STT that is mostly the agent's own TTS picked up by the mic."""
+    u = _normalize_echo_text(user_text)
+    a = _normalize_echo_text(agent_text)
+    if not u or not a:
+        return False
+    if len(u) >= 8 and (u in a or a in u):
+        return True
+    u_words = [w for w in u.split() if len(w) > 1]
+    a_words = set(w for w in a.split() if len(w) > 1)
+    if len(u_words) >= 2 and a_words:
+        overlap = sum(1 for w in u_words if w in a_words) / len(u_words)
+        if overlap >= 0.55:
+            return True
+    return False
+
+
+def _is_ack_only(text: str) -> bool:
+    words = [
+        re.sub(r"[^\w]", "", w).lower()
+        for w in re.split(r"\s+", (text or "").strip())
+        if w
+    ]
+    if not words:
+        return True
+    return all(w in _LATIN_ACKS or w in _INDIC_ACKS for w in words)
+
+
+_INTERRUPT_MARKERS = re.compile(
+    r"\b(wait|stop|ruko|ruk|sun|suno|suniye|listen|nahi|no|galat|wrong|"
+    r"band|chup|hold|busy|baad|later|callback)\b|"
+    r"(रुको|सुन|सुनो|सुनिए|नही|गलत|बंद|बाद|मत)",
+    re.I,
+)
+
+
+def _has_interrupt_intent(text: str) -> bool:
+    return bool(_INTERRUPT_MARKERS.search(text or ""))
 
 
 def _sanitize_speech(text: str) -> str:
@@ -500,18 +599,18 @@ class VoiceAgent:
         default_lang = os.getenv("DEFAULT_CALL_LANGUAGE", DEFAULT_CALL_LANGUAGE)
         customer_lang = {"v": default_lang, "hint_sent": False}
         en_streak = {"n": 0}
+        customer_turns = {"n": 0}
         tts_lock = asyncio.Lock()      # one Sarvam WS speaker at a time
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
         barge_in_ok = {"v": False}
         # Grace only for VAD soft-mute (echo protection).
-        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.35"))
+        BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.8"))
         # After a reply starts, ignore trailing speech_final that would re-cancel it.
         REPLY_GUARD_S = float(os.getenv("REPLY_GUARD_S", "1.0"))
-        SOFT_MUTE_S = float(os.getenv("SOFT_MUTE_S", "1.5"))
-        audio_drop_until = {"t": 0.0, "armed": False}
         reply_guard_until = {"t": 0.0}
         last_utt = {"text": "", "t": 0.0}
+        recent_agent = {"text": ""}
 
 
         async def emit(event):
@@ -524,27 +623,6 @@ class VoiceAgent:
                 else:
                     audio_interrupt_callback()
             await emit({"type": "interrupted"})
-
-        async def _clear_soft_mute(resume=False):
-            audio_drop_until["t"] = 0.0
-            audio_drop_until["armed"] = False
-            if resume:
-                logger.info("Soft-mute cleared — resuming agent audio")
-
-        async def soft_mute_playback(reason="SpeechStarted"):
-            """Stop what the caller hears WITHOUT killing the LLM turn."""
-            if not barge_in_ok["v"] or not speaking["on"]:
-                return False
-            if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
-                return False
-            now = time.monotonic()
-            was_armed = audio_drop_until["armed"]
-            audio_drop_until["t"] = now + SOFT_MUTE_S
-            audio_drop_until["armed"] = True
-            if not was_armed:
-                logger.info(f"Soft-mute ({reason})")
-                await _flush_client_audio()
-            return True
 
         # ---- barge-in -------------------------------------------------------
         async def interrupt_agent(reason="speech", *, force=False):
@@ -568,8 +646,6 @@ class VoiceAgent:
             logger.info(f"Barge-in ({reason}, force={force})")
             speaking["on"] = False
             agent_busy["v"] = False
-            audio_drop_until["t"] = 0.0
-            audio_drop_until["armed"] = False
             task.cancel()
             await _flush_client_audio()
             return True
@@ -633,10 +709,9 @@ class VoiceAgent:
                                 mtype = msg.get("type")
 
                                 if mtype == "SpeechStarted":
-                                    # Mute playback only — do NOT cancel the turn
-                                    # (cancelling here caused 3–5s dead air).
-                                    if speaking["on"]:
-                                        await soft_mute_playback("SpeechStarted")
+                                    # Ignore VAD during agent speech — soft-mute caused
+                                    # mid-sentence silence when STT was echo/noise.
+                                    pass
                                 elif mtype == "Results":
                                     alt = (((msg.get("channel") or {}).get("alternatives")
                                             or [{}])[0])
@@ -698,14 +773,21 @@ class VoiceAgent:
             score, reason = _utterance_confidence(text, alt_confidence, all_words)
 
             if reason != "ok":
-                await _clear_soft_mute(resume=True)
                 logger.info(f"STT rejected ({reason}): text={text!r}")
                 return False
 
             if not _allows_turn(score, _turn_confidence_floor(text, stt_min_confidence)):
-                await _clear_soft_mute(resume=True)
                 logger.info(
                     f"STT rejected (low_confidence): score={score} text={text!r}")
+                return False
+
+            agent_active = speaking["on"] or agent_busy["v"]
+            if agent_active and not _allows_barge_in(
+                text,
+                agent_speaking=speaking["on"],
+                recent_agent=recent_agent["text"],
+            ):
+                logger.info(f"Barge-in ignored (echo/ack): text={text!r}")
                 return False
 
             # Drop duplicate finals (speech_final + UtteranceEnd of same text).
@@ -718,8 +800,10 @@ class VoiceAgent:
             last_utt["t"] = now
 
             prev_lang = customer_lang["v"]
+            is_first = customer_turns["n"] == 0
             customer_lang["v"] = _update_customer_language(
-                text, customer_lang["v"], en_streak)
+                text, customer_lang["v"], en_streak, is_first_response=is_first)
+            customer_turns["n"] += 1
             if customer_lang["v"] != prev_lang:
                 customer_lang["hint_sent"] = False
                 logger.info(f"Customer language updated: {customer_lang['v']}")
@@ -753,7 +837,7 @@ class VoiceAgent:
                 "model": model,
                 "messages": msgs,
                 "temperature": 0.4,
-                "max_tokens": 220,
+                "max_tokens": 150,
                 "tools": self.tools,
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -945,12 +1029,6 @@ class VoiceAgent:
             return tts["ws"]
 
         async def _emit_audio(pcm):
-            now = time.monotonic()
-            # Mute expired without a validated user turn → resume agent audio.
-            if audio_drop_until["armed"] and now >= audio_drop_until["t"]:
-                await _clear_soft_mute(resume=True)
-            if now < audio_drop_until["t"]:
-                return
             # Mark speaking only when PCM actually leaves — never while waiting
             # on the TTS lock (that caused false barge-ins canceling the greeting).
             if not speaking["on"]:
@@ -959,8 +1037,6 @@ class VoiceAgent:
             # Send in ~60ms chunks so barge-in cancellation is responsive.
             step = int(TTS_SAMPLE_RATE * 2 * 0.06)
             for i in range(0, len(pcm), step):
-                if time.monotonic() < audio_drop_until["t"]:
-                    return
                 if inspect.iscoroutinefunction(audio_output_callback):
                     await audio_output_callback(pcm[i:i + step])
                 else:
@@ -1134,10 +1210,12 @@ class VoiceAgent:
                     owner = "ग्राहक"
 
                 greeting = (
-                    f"नमस्ते! मैं राहुल बोल रहा हूँ, Kataria Automobiles से. "
-                    f"क्या मैं {owner} जी से बात कर सकता हूँ?"
+                    f"Namaste! Main Rahul bol raha hoon, Kataria Automobiles se. "
+                    f"Kya main {owner} ji se baat kar sakta hoon?"
                 )
-                record_note = "यह कॉल training और quality के लिए record हो रही है."
+                record_note = (
+                    "Yeh call training aur quality ke liye record ho rahi hai."
+                )
                 full = f"{greeting} {record_note}"
 
                 # Seed chat history so later turns have full vehicle context.
@@ -1163,6 +1241,7 @@ class VoiceAgent:
                 messages.append({"role": "assistant", "content": full})
 
                 await emit({"type": "agent", "text": full})
+                recent_agent["text"] = full[-500:]
                 await speak_text(full, lang="hi-IN")
                 greeted["done"] = True
                 barge_in_ok["v"] = True
@@ -1182,23 +1261,19 @@ class VoiceAgent:
             barge_in_ok["v"] = True
             agent_busy["v"] = True
             reply_guard_until["t"] = time.monotonic() + REPLY_GUARD_S
-            audio_drop_until["t"] = 0.0
-            audio_drop_until["armed"] = False
             try:
                 if not customer_lang["hint_sent"]:
                     messages.append({
                         "role": "system",
-                        "content": _language_hint(customer_lang["v"]),
+                        "content": (
+                            f"{_language_hint(customer_lang['v'])} "
+                            "ONE call-flow step this turn only (max 2 short sentences), "
+                            "then wait for the customer."
+                        ),
                     })
                     customer_lang["hint_sent"] = True
 
                 user_content = user_text
-                if not _has_indic_script(user_text):
-                    user_content = (
-                        f"{user_text}\n"
-                        f"[Note: STT may be inaccurate; customer likely speaks Hindi — "
-                        f"respond in Hindi Devanagari unless they clearly use English.]"
-                    )
                 messages.append({"role": "user", "content": user_content})
                 turn_tts_lang = customer_lang["v"]
                 for _ in range(5):  # tool-call loop guard
@@ -1219,6 +1294,9 @@ class VoiceAgent:
                             speak_task = asyncio.create_task(
                                 speak_stream(sentence_queue, speak_lang["v"]))
                         agent_text_parts.append(s)
+                        recent_agent["text"] = (
+                            f"{recent_agent['text']} {s}".strip()[-500:]
+                        )
                         await emit({"type": "agent", "text": s})
                         await sentence_queue.put(s)
 

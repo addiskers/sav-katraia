@@ -836,7 +836,7 @@ class VoiceAgent:
                 "model": model,
                 "messages": msgs,
                 "temperature": 0.4,
-                "max_tokens": 220,
+                "max_tokens": 600,
                 "tools": self.tools,
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -848,6 +848,9 @@ class VoiceAgent:
                     "order": ["Groq", "Cerebras"],
                     "allow_fallbacks": True,
                 }
+                # gpt-oss is a reasoning model: cap thinking so it can't burn
+                # the whole token budget reasoning and return empty speech.
+                payload["reasoning"] = {"effort": "low"}
 
             headers = {
                 "Authorization": f"Bearer {llm_key}",
@@ -951,6 +954,9 @@ class VoiceAgent:
                 raise RuntimeError("LLM streaming failed after retries")
 
             content = "".join(content_parts)
+            if not content.strip() and not tool_calls:
+                logger.warning(
+                    f"LLM returned no speech (finish_reason={finish_reason})")
             tcs = [
                 {"id": v["id"] or v["name"], "type": "function",
                  "function": {"name": v["name"], "arguments": v["arguments"]}}
@@ -1310,6 +1316,7 @@ class VoiceAgent:
                 user_content = user_text
                 messages.append({"role": "user", "content": user_content})
                 turn_tts_lang = customer_lang["v"]
+                nudged = {"v": False}
                 for _ in range(5):  # tool-call loop guard
                     sentence_queue = asyncio.Queue()
                     agent_text_parts = []
@@ -1374,8 +1381,24 @@ class VoiceAgent:
                     content = _sanitize_speech("".join(agent_text_parts).strip())
                     if content:
                         messages.append({"role": "assistant", "content": content})
-                    elif not tool_calls:
-                        logger.warning("Agent turn produced no speech text")
+                    elif not nudged["v"]:
+                        # Reasoning model burned its budget thinking, or chose
+                        # silence — retry ONCE with an explicit speak nudge so
+                        # the caller never gets dead air.
+                        nudged["v"] = True
+                        logger.warning(
+                            "Agent turn produced no speech — retrying with nudge")
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "You MUST reply with spoken text now. Answer the "
+                                "customer's last message directly in 1-2 short "
+                                "sentences. Do not stay silent."
+                            ),
+                        })
+                        continue
+                    else:
+                        logger.warning("Agent turn still empty after nudge")
                     await emit({"type": "turn_complete"})
                     return
             finally:

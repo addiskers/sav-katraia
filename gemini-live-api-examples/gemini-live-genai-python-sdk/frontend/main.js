@@ -74,7 +74,9 @@ const sarvamClient = new SarvamClient({
         console.error("Parse error:", e);
       }
     } else {
-      mediaHandler.playAudio(event.data);
+      mediaHandler.playAudio(event.data).catch((e) =>
+        console.warn("playAudio failed:", e)
+      );
     }
   },
   onClose: (e) => {

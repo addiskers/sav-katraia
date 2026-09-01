@@ -159,8 +159,8 @@ async def websocket_endpoint(websocket: WebSocket):
         if not client_disconnected:
             try:
                 await websocket.send_bytes(data)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Audio send to client failed: {e}")
 
     async def audio_interrupt_callback():
         # Flush browser audio immediately — don't wait for the event-queue round-trip.

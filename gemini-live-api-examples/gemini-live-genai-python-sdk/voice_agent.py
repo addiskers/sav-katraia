@@ -1012,7 +1012,8 @@ class VoiceAgent:
                        f"&send_completion_event=true")
                 headers = {"Api-Subscription-Key": sarvam_key}
                 tts["ws"] = await websockets.connect(
-                    url, additional_headers=headers, max_size=None)
+                    url, additional_headers=headers, max_size=None,
+                    open_timeout=20, close_timeout=5)
                 tts["lang"] = None
             if tts["lang"] != lang:
                 await tts["ws"].send(json.dumps({
@@ -1150,6 +1151,8 @@ class VoiceAgent:
             finally:
                 if chars_sent:
                     await emit({"type": "usage", "tts_chars": chars_sent})
+                logger.info(
+                    f"TTS done: {chars_sent} chars, audio_played={got_audio['v']}")
 
         async def speak_text(text, lang=None):
             """Speak a fully-known string via streaming TTS."""
@@ -1210,16 +1213,10 @@ class VoiceAgent:
             except Exception as e:
                 logger.warning(f"LLM prewarm failed: {e}")
 
-            # Open Sarvam TTS WS only (no filler synth — that blocked greeting
-            # on the TTS lock and caused false barge-ins).
-            try:
-                await _ensure_tts("hi-IN")
-                logger.info("Sarvam TTS WebSocket prewarmed (reused for call)")
-            except Exception as e:
-                logger.warning(f"Sarvam TTS prewarm failed: {e}")
-                await _close_tts()
+            # TTS is opened on first speak (greeting) — do NOT prewarm here;
+            # racing _ensure_tts() with greeting corrupted the Sarvam WS.
 
-        # ---- greeting shortcut (skip 2 LLM roundtrips on call start) -------
+        # ---- greeting shortcut (skip 2 LLM roundtrips on call start) --------
         async def run_greeting():
             # No barge-in during greeting — browser mic / TTS lock wait used to
             # cancel this before any audio played (logs: "interrupted by caller").

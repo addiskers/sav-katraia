@@ -202,13 +202,13 @@ class MediaHandler {
     onFrame(base64);
   }
 
-  playAudio(arrayBuffer) {
+  async playAudio(arrayBuffer) {
     if (!this.audioContext) return;
     // Drop audio chunks that arrive right after an interrupt
     if (this.playbackMuted) return;
 
     if (this.audioContext.state === "suspended") {
-      this.audioContext.resume();
+      await this.audioContext.resume();
     }
 
     const pcmData = new Int16Array(arrayBuffer);

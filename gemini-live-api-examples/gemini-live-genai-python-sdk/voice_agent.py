@@ -476,8 +476,8 @@ class VoiceAgent:
                 "stream_options": {"include_usage": True},
             }
             if use_openrouter:
-                # R&D bench: Groq TTFT beat Cerebras on OpenRouter for this prompt
-                # (~390ms vs ~550ms). Cerebras stays as fast fallback (higher tok/s).
+                # Fastest measured route: Groq TTFT beat Cerebras for this prompt.
+                # Cerebras stays as high-tok/s fallback if Groq is rate-limited.
                 payload["provider"] = {
                     "order": ["Groq", "Cerebras"],
                     "allow_fallbacks": True,

@@ -929,7 +929,7 @@ function renderStats(){
   const cards=[
     {label:'Total calls',value:fmtNum(s.total_calls),sub:(s.by_source?Object.entries(s.by_source).map(([k,v])=>k+': '+v).join(' · '):'')},
     {label:'Total minutes',value:(s.total_minutes!=null?s.total_minutes.toFixed(1):'—')},
-    {label:'AI cost',value:fmtUSD(s.ai_cost_usd),cls:'hi',sub:'Deepgram + Groq + Sarvam'},
+    {label:'AI cost',value:fmtUSD(s.ai_cost_usd),cls:'hi',sub:'Deepgram + LLM + Sarvam'},
     {label:'Twilio cost',value:fmtUSD(s.twilio_cost_usd),cls:'cy'},
     {label:'Total real cost',value:fmtUSD(s.total_cost_usd),cls:'cy'},
     {label:'Avg cost / call',value:fmtUSD(s.avg_cost_per_call)},
@@ -1054,8 +1054,9 @@ function renderDrawer(c){
       '<div class="cost-grid">'+
         '<div class="cost-card ai"><div class="ct">AI cost (STT + LLM + TTS)</div><div class="big">'+fmtUSD(sv.cost_usd)+'</div>'+
           '<div class="kv"><span>STT (Deepgram)</span><span>'+((us.stt_seconds!=null)?us.stt_seconds.toFixed(1)+'s · '+fmtUSD(st.stt):'—')+'</span></div>'+
-          '<div class="kv"><span>LLM in (Groq)</span><span>'+fmtNum(us.llm_in)+' · '+fmtUSD(st.llm_in)+'</span></div>'+
-          '<div class="kv"><span>LLM out (Groq)</span><span>'+fmtNum(us.llm_out)+' · '+fmtUSD(st.llm_out)+'</span></div>'+
+          '<div class="kv"><span>LLM in</span><span>'+fmtNum(us.llm_in)+' · '+fmtUSD(st.llm_in)+'</span></div>'+
+          '<div class="kv"><span>LLM out</span><span>'+fmtNum(us.llm_out)+' · '+fmtUSD(st.llm_out)+'</span></div>'+
+          '<div class="kv"><span>LLM route</span><span>'+((sv.providers||{}).llm||'openrouter')+'</span></div>'+
           '<div class="kv"><span>TTS chars (Sarvam)</span><span>'+fmtNum(us.tts_chars)+' · '+fmtUSD(st.tts)+'</span></div>'+
         '</div>'+
         '<div class="cost-card tw"><div class="ct">Twilio cost</div><div class="big">'+(tw.price_usd==null?'—':fmtUSD(tw.price_usd))+'</div>'+

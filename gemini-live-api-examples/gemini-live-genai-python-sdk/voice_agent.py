@@ -321,7 +321,9 @@ def _split_sentences(text: str, max_len: int = 140):
         p = p.strip()
         if not p:
             continue
-        if len(p) > 60:
+        # Only split on commas for very long clauses — mid-clause commas
+        # caused truncated TTS ("...Baleno ki" then silence).
+        if len(p) > 100:
             parts.extend(s.strip() for s in re.split(r"(?<=[,।])\s+", p) if s.strip())
         else:
             parts.append(p)
@@ -812,6 +814,7 @@ class VoiceAgent:
                 await interrupt_agent("speech_final", force=True)
 
             await emit({"type": "user", "text": text})
+            logger.info(f"User turn accepted: {text!r}")
             await emit({"type": "turn_complete"})
             await turn_queue.put(text)
             return True
@@ -837,7 +840,7 @@ class VoiceAgent:
                 "model": model,
                 "messages": msgs,
                 "temperature": 0.4,
-                "max_tokens": 150,
+                "max_tokens": 180,
                 "tools": self.tools,
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -1049,6 +1052,7 @@ class VoiceAgent:
             Reuses the session WebSocket (R&D: ~40-50ms faster than reconnect).
             """
             chars_sent = 0
+            sender_done = asyncio.Event()
             try:
                 async with tts_lock:
                     ws = await _ensure_tts(lang)
@@ -1059,6 +1063,7 @@ class VoiceAgent:
                             sentence = await sentence_queue.get()
                             if sentence is None:
                                 await ws.send(json.dumps({"type": "flush"}))
+                                sender_done.set()
                                 return
                             if not sentence.strip():
                                 continue
@@ -1084,7 +1089,9 @@ class VoiceAgent:
                                     await _emit_audio(pcm)
                             elif mtype == "event":
                                 et = (msg.get("data") or {}).get("event_type")
-                                if et == "final":
+                                # Sarvam emits `final` after EACH text chunk.
+                                # Only exit after flush + final, or all audio is lost.
+                                if et == "final" and sender_done.is_set():
                                     break
                             elif mtype == "error":
                                 err = (msg.get("data") or {}).get("message") or str(msg)

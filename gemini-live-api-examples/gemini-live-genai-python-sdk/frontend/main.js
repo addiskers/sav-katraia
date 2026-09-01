@@ -322,6 +322,7 @@ function handleJsonMessage(msg) {
     currentAgentMessageDiv = null;
     currentUserMessageDiv = null;
   } else if (msg.type === "turn_complete") {
+    mediaHandler.endAgentTurn();
     currentAgentMessageDiv = null;
     currentUserMessageDiv = null;
   } else if (msg.type === "user") {
@@ -338,6 +339,7 @@ function handleJsonMessage(msg) {
       callTranscript.push({ role: "user", text: msg.text, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
     }
   } else if (msg.type === "agent") {
+    mediaHandler.beginAgentTurn();
     if (currentAgentMessageDiv) {
       const textEl = currentAgentMessageDiv.querySelector(".msg-text");
       if (textEl) textEl.textContent += msg.text;

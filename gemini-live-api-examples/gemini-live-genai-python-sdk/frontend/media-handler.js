@@ -21,11 +21,34 @@ class MediaHandler {
 
     // Half-duplex: gate mic uplink while agent audio is playing (prevents echo STT).
     this.micGateUntil = 0;
+    // Hold mic gate for full agent turn (not just between PCM chunks).
+    this.agentTurnActive = false;
     // Drop in-flight PCM briefly after a real barge-in interrupt.
     this.playbackMuted = false;
   }
 
+  beginAgentTurn() {
+    this.agentTurnActive = true;
+    if (this.audioContext) {
+      this.micGateUntil = Math.max(
+        this.micGateUntil || 0,
+        this.audioContext.currentTime + 60,
+      );
+    }
+  }
+
+  endAgentTurn() {
+    this.agentTurnActive = false;
+    if (this.audioContext) {
+      this.micGateUntil = Math.max(
+        this.micGateUntil || 0,
+        this.audioContext.currentTime + 0.4,
+      );
+    }
+  }
+
   isMicGated() {
+    if (this.agentTurnActive) return true;
     if (!this.audioContext) return false;
     return this.audioContext.currentTime < (this.micGateUntil || 0);
   }
@@ -248,6 +271,7 @@ class MediaHandler {
   stopAudioPlayback() {
     // Mute playback to drop any audio chunks still in-flight from server
     this.playbackMuted = true;
+    this.agentTurnActive = false;
     this.micGateUntil = 0;
     if (this.outputGain) {
       try {

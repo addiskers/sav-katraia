@@ -214,19 +214,34 @@ def _tts_language_for(text: str) -> str:
     return DEFAULT_CALL_LANGUAGE
 
 
-def _update_customer_language(text: str, current: str) -> str:
-    """Switch reply/TTS language only on strong, reliable signals."""
+def _update_customer_language(text: str, current: str, en_streak: dict | None = None) -> str:
+    """Switch reply/TTS language only on strong, reliable signals.
+
+    en_streak: optional {"n": int} — consecutive Latin-only turns. English
+    requires several clear English turns, not one noisy STT fragment.
+    """
     gu, dev, latin = _script_counts(text)
     if gu > 2 and gu > dev:
+        if en_streak is not None:
+            en_streak["n"] = 0
         return "gu-IN"
     if dev > 0:
+        if en_streak is not None:
+            en_streak["n"] = 0
         return "hi-IN"
-    if latin > 0:
+    if latin > 0 and gu == 0 and dev == 0:
         words = [w for w in re.split(r"\s+", text.strip()) if w]
-        # Sustained clear English only — not "Hello?" or STT garbage.
-        min_en_words = int(_env_float("ENGLISH_SWITCH_MIN_WORDS", 4))
+        min_en_words = int(_env_float("ENGLISH_SWITCH_MIN_WORDS", 8))
+        need_streak = int(_env_float("ENGLISH_SWITCH_STREAK", 2))
         if len(words) >= min_en_words:
+            if en_streak is not None:
+                en_streak["n"] = en_streak.get("n", 0) + 1
+                if en_streak["n"] >= need_streak:
+                    return "en-IN"
+                return current or DEFAULT_CALL_LANGUAGE
             return "en-IN"
+        if en_streak is not None:
+            en_streak["n"] = 0
     return current or DEFAULT_CALL_LANGUAGE
 
 
@@ -483,6 +498,7 @@ class VoiceAgent:
         greeted = {"done": False}
         default_lang = os.getenv("DEFAULT_CALL_LANGUAGE", DEFAULT_CALL_LANGUAGE)
         customer_lang = {"v": default_lang, "hint_sent": False}
+        en_streak = {"n": 0}
         tts_lock = asyncio.Lock()      # one Sarvam WS speaker at a time
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
@@ -491,8 +507,8 @@ class VoiceAgent:
         BARGE_IN_GRACE_S = float(os.getenv("BARGE_IN_GRACE_S", "0.35"))
         # After a reply starts, ignore trailing speech_final that would re-cancel it.
         REPLY_GUARD_S = float(os.getenv("REPLY_GUARD_S", "1.0"))
-        SOFT_MUTE_S = float(os.getenv("SOFT_MUTE_S", "1.25"))
-        audio_drop_until = {"t": 0.0}
+        SOFT_MUTE_S = float(os.getenv("SOFT_MUTE_S", "1.5"))
+        audio_drop_until = {"t": 0.0, "armed": False}
         reply_guard_until = {"t": 0.0}
         last_utt = {"text": "", "t": 0.0}
 
@@ -511,17 +527,20 @@ class VoiceAgent:
         async def soft_mute_playback(reason="SpeechStarted"):
             """Stop what the caller hears WITHOUT killing the LLM turn.
 
-            SpeechStarted alone used to cancel the turn → dead air until STT
-            finalized (often 3–5s). Soft-mute drops PCM + flushes the browser;
-            hard cancel happens only when real transcript text arrives.
+            Extends the mute window on repeated VAD. If mute expires without a
+            transcript, hard-cancel so we never resume talking over the caller.
             """
             if not barge_in_ok["v"] or not speaking["on"]:
                 return False
             if (time.monotonic() - speaking_since["t"]) < BARGE_IN_GRACE_S:
                 return False
-            audio_drop_until["t"] = time.monotonic() + SOFT_MUTE_S
-            logger.info(f"Soft-mute ({reason})")
-            await _flush_client_audio()
+            now = time.monotonic()
+            was_armed = audio_drop_until["armed"]
+            audio_drop_until["t"] = now + SOFT_MUTE_S
+            audio_drop_until["armed"] = True
+            if not was_armed:
+                logger.info(f"Soft-mute ({reason})")
+                await _flush_client_audio()
             return True
 
         # ---- barge-in -------------------------------------------------------
@@ -547,6 +566,7 @@ class VoiceAgent:
             speaking["on"] = False
             agent_busy["v"] = False
             audio_drop_until["t"] = 0.0
+            audio_drop_until["armed"] = False
             task.cancel()
             await _flush_client_audio()
             return True
@@ -620,9 +640,13 @@ class VoiceAgent:
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
-                                    # Real text while agent speaks → hard-cancel.
-                                    if speaking["on"] and _allows_barge_in(text):
-                                        await interrupt_agent("interim", force=False)
+                                    # Real text while agent speaks / soft-muted → hard-cancel.
+                                    # force=True once soft-muted (caller clearly interrupting).
+                                    if (speaking["on"] or audio_drop_until["armed"]) and _allows_barge_in(text):
+                                        await interrupt_agent(
+                                            "interim",
+                                            force=bool(audio_drop_until["armed"]),
+                                        )
                                     if msg.get("is_final"):
                                         pending_final.append({
                                             "text": text,
@@ -676,13 +700,15 @@ class VoiceAgent:
             score, reason = _utterance_confidence(text, alt_confidence, all_words)
 
             if reason != "ok":
-                # Resume soft-muted audio if STT was garbage (false VAD).
+                # False VAD / garbage — clear soft-mute so agent can resume.
                 audio_drop_until["t"] = 0.0
+                audio_drop_until["armed"] = False
                 logger.info(f"STT rejected ({reason}): text={text!r}")
                 return False
 
             if not _allows_turn(score, _turn_confidence_floor(text, stt_min_confidence)):
                 audio_drop_until["t"] = 0.0
+                audio_drop_until["armed"] = False
                 logger.info(
                     f"STT rejected (low_confidence): score={score} text={text!r}")
                 return False
@@ -697,7 +723,8 @@ class VoiceAgent:
             last_utt["t"] = now
 
             prev_lang = customer_lang["v"]
-            customer_lang["v"] = _update_customer_language(text, customer_lang["v"])
+            customer_lang["v"] = _update_customer_language(
+                text, customer_lang["v"], en_streak)
             if customer_lang["v"] != prev_lang:
                 customer_lang["hint_sent"] = False
                 logger.info(f"Customer language updated: {customer_lang['v']}")
@@ -923,8 +950,15 @@ class VoiceAgent:
             return tts["ws"]
 
         async def _emit_audio(pcm):
-            # Soft-mute: drop PCM while caller may be speaking (SpeechStarted).
-            if time.monotonic() < audio_drop_until["t"]:
+            now = time.monotonic()
+            # Soft-mute expired → hard-cancel (never resume talking over caller).
+            if audio_drop_until["armed"] and now >= audio_drop_until["t"]:
+                audio_drop_until["armed"] = False
+                audio_drop_until["t"] = 0.0
+                asyncio.create_task(
+                    interrupt_agent("soft_mute_expired", force=True))
+                return
+            if now < audio_drop_until["t"]:
                 return
             # Mark speaking only when PCM actually leaves — never while waiting
             # on the TTS lock (that caused false barge-ins canceling the greeting).
@@ -1158,6 +1192,7 @@ class VoiceAgent:
             agent_busy["v"] = True
             reply_guard_until["t"] = time.monotonic() + REPLY_GUARD_S
             audio_drop_until["t"] = 0.0
+            audio_drop_until["armed"] = False
             try:
                 if not customer_lang["hint_sent"]:
                     messages.append({

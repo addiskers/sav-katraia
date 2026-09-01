@@ -62,7 +62,8 @@ SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 # ---- Deepgram STT (env-overridable; re-read in start_session) --------------
 # nova-3 supports language=multi (Hindi/English/Gujarati code-mixing).
 STT_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-3")
-STT_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "multi")
+STT_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "hi")
+DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "hi-IN")
 
 # ---- Sarvam TTS (env-overridable) ------------------------------------------
 TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
@@ -91,17 +92,22 @@ def get_system_instruction():
     day_after = today + timedelta(days=2)
     return (
         f"You are Rahul (ONLY Rahul) at Kataria Automobiles (spell Kataria, never Katrina), "
-        f"Maruti Suzuki dealership, Ahmedabad. LIVE phone call — words are spoken aloud.\n"
-        f"OUTPUT: plain speech only (no markdown/bullets/emoji/parentheses). Native script "
-        f"(Hindi/Marathi Devanagari, Gujarati script, English Latin). Never romanize "
-        f"Indian languages. 1–2 short sentences per turn; one step then wait. Never "
-        f"narrate reasoning or stage directions; if on hold stay silent.\n"
+        f"Maruti Suzuki dealership, Ahmedabad. LIVE outbound service-reminder call.\n"
+        f"DEFAULT LANGUAGE: Hindi Devanagari. Customers speak Hindi or Gujarati. "
+        f"Only switch to English if the customer speaks several clear English sentences. "
+        f"Never switch to English for garbled STT or single words like hello/yes.\n"
+        f"OUTPUT: plain speech only (no markdown/bullets/emoji/parentheses). Hindi Devanagari "
+        f"unless customer clearly uses Gujarati script or sustained English. Never romanize "
+        f"Hindi/Gujarati. 1–2 short sentences per turn; one step then wait. Never narrate "
+        f"reasoning or stage directions.\n"
+        f"FORBIDDEN: generic English help-desk lines like 'How can I help/assist you today'. "
+        f"You know why you called — their Maruti service is due. Stay on the service flow.\n"
         f"DATES: Today {today.strftime('%Y-%m-%d')} ({today.strftime('%A')}); "
         f"kal/tomorrow={tomorrow.strftime('%Y-%m-%d')}; "
         f"parso/day-after={day_after.strftime('%Y-%m-%d')}. Pickup dates are near-future "
         f"(today+0–14d only). Never use warranty/purchase/service-history dates.\n"
-        f"LANGUAGE: open Hindi; after customer's first reply switch fully to their "
-        f"language (en/gu/mr/hi) and stay. Never mix.\n"
+        f"LANGUAGE: open in Hindi. Switch to Gujarati only if customer uses Gujarati script. "
+        f"Switch to English only after sustained clear English — never from one short phrase.\n"
         f"ACK: if customer only acknowledges (short yes/ok/go ahead), proceed directly to "
         f"step 2 (vehicle+service+pickup); do not ask which language they prefer.\n"
         f"LISTEN: if customer says suno/suniye/listen or sounds frustrated, stop repeating, "
@@ -177,10 +183,9 @@ def _strip_wav_header(data: bytes) -> bytes:
     return data[idx + 8:]
 
 
-def _tts_language_for(text: str) -> str:
-    """Pick the Bulbul language code from the script of the reply text."""
+def _script_counts(text: str):
     gujarati = devanagari = latin = 0
-    for ch in text:
+    for ch in text or "":
         o = ord(ch)
         if 0x0A80 <= o <= 0x0AFF:
             gujarati += 1
@@ -188,13 +193,65 @@ def _tts_language_for(text: str) -> str:
             devanagari += 1
         elif "a" <= ch.lower() <= "z":
             latin += 1
-    if gujarati > devanagari and gujarati > latin:
+    return gujarati, devanagari, latin
+
+
+def _has_indic_script(text: str) -> bool:
+    gu, dev, _ = _script_counts(text)
+    return (gu + dev) > 0
+
+
+def _tts_language_for(text: str) -> str:
+    """Pick Bulbul language from script counts (fallback when no call language set)."""
+    gu, dev, latin = _script_counts(text)
+    if gu > dev and gu > latin:
         return "gu-IN"
-    if devanagari >= latin and devanagari > 0:
+    if dev >= latin and dev > 0:
         return "hi-IN"
     if latin > 0:
         return "en-IN"
-    return "hi-IN"
+    return DEFAULT_CALL_LANGUAGE
+
+
+def _update_customer_language(text: str, current: str) -> str:
+    """Switch reply/TTS language only on strong, reliable signals."""
+    gu, dev, latin = _script_counts(text)
+    if gu > 2 and gu > dev:
+        return "gu-IN"
+    if dev > 0:
+        return "hi-IN"
+    if latin > 0:
+        words = [w for w in re.split(r"\s+", text.strip()) if w]
+        # Sustained clear English only — not "Hello?" or STT garbage.
+        min_en_words = int(_env_float("ENGLISH_SWITCH_MIN_WORDS", 4))
+        if len(words) >= min_en_words:
+            return "en-IN"
+    return current or DEFAULT_CALL_LANGUAGE
+
+
+def _turn_confidence_floor(text: str, base_min: float) -> float:
+    """Latin-only STT on Hindi calls is often garbage — require higher confidence."""
+    if _has_indic_script(text):
+        return base_min
+    words = [w for w in re.split(r"\s+", (text or "").strip()) if w]
+    if len(words) <= 2:
+        return max(base_min, _env_float("STT_LATIN_SHORT_CONF", 0.78))
+    if len(words) <= 4:
+        return max(base_min, _env_float("STT_LATIN_MEDIUM_CONF", 0.68))
+    return max(base_min, _env_float("STT_LATIN_MIN_CONF", 0.58))
+
+
+def _language_hint(lang_code: str) -> str:
+    labels = {
+        "hi-IN": "Hindi (Devanagari script)",
+        "gu-IN": "Gujarati script",
+        "en-IN": "English",
+    }
+    label = labels.get(lang_code, lang_code)
+    return (
+        f"Reply ONLY in {label} for this turn. Never mix scripts. "
+        f"Never use generic English help-desk phrases."
+    )
 
 
 def _split_sentences(text: str, max_len: int = 140):
@@ -423,7 +480,8 @@ class VoiceAgent:
         agent_busy = {"v": False}      # LLM+TTS turn in flight (broader than speaking)
         current_turn = {"task": None}  # in-flight agent turn task
         greeted = {"done": False}
-        customer_lang = {"v": None, "hint_sent": False}
+        default_lang = os.getenv("DEFAULT_CALL_LANGUAGE", DEFAULT_CALL_LANGUAGE)
+        customer_lang = {"v": default_lang, "hint_sent": False}
         tts_lock = asyncio.Lock()      # one Sarvam WS speaker at a time
         # Barge-in disabled during greeting / until first real audio plays.
         # Also ignored for BARGE_IN_GRACE_S after audio starts (mic hears TTS echo).
@@ -582,14 +640,16 @@ class VoiceAgent:
                 logger.info(f"STT rejected ({reason}): text={text!r}")
                 return False
 
-            if not _allows_turn(score, stt_min_confidence):
+            if not _allows_turn(score, _turn_confidence_floor(text, stt_min_confidence)):
                 logger.info(
                     f"STT rejected (low_confidence): score={score} text={text!r}")
                 return False
 
-            if customer_lang["v"] is None:
-                customer_lang["v"] = _tts_language_for(text)
-                logger.info(f"Customer language locked: {customer_lang['v']}")
+            prev_lang = customer_lang["v"]
+            customer_lang["v"] = _update_customer_language(text, customer_lang["v"])
+            if customer_lang["v"] != prev_lang:
+                customer_lang["hint_sent"] = False
+                logger.info(f"Customer language updated: {customer_lang['v']}")
 
             await emit({"type": "user", "text": text})
             await emit({"type": "turn_complete"})
@@ -1033,23 +1093,21 @@ class VoiceAgent:
             barge_in_ok["v"] = True
             agent_busy["v"] = True
             try:
-                if customer_lang["v"] and not customer_lang["hint_sent"]:
-                    lang_labels = {
-                        "hi-IN": "Hindi (Devanagari script)",
-                        "gu-IN": "Gujarati script",
-                        "en-IN": "English",
-                    }
-                    label = lang_labels.get(customer_lang["v"], customer_lang["v"])
+                if not customer_lang["hint_sent"]:
                     messages.append({
                         "role": "system",
-                        "content": (
-                            f"Customer language is {label}. Reply ONLY in that "
-                            f"language/script for the rest of this call. Never mix."
-                        ),
+                        "content": _language_hint(customer_lang["v"]),
                     })
                     customer_lang["hint_sent"] = True
 
-                messages.append({"role": "user", "content": user_text})
+                user_content = user_text
+                if not _has_indic_script(user_text):
+                    user_content = (
+                        f"{user_text}\n"
+                        f"[Note: STT may be inaccurate; customer likely speaks Hindi — "
+                        f"respond in Hindi Devanagari unless they clearly use English.]"
+                    )
+                messages.append({"role": "user", "content": user_content})
                 turn_tts_lang = customer_lang["v"]
                 for _ in range(5):  # tool-call loop guard
                     sentence_queue = asyncio.Queue()
@@ -1065,8 +1123,7 @@ class VoiceAgent:
                             return
                         if not started_speaking["v"]:
                             started_speaking["v"] = True
-                            if not speak_lang["v"]:
-                                speak_lang["v"] = _tts_language_for(s)
+                            speak_lang["v"] = turn_tts_lang or DEFAULT_CALL_LANGUAGE
                             speak_task = asyncio.create_task(
                                 speak_stream(sentence_queue, speak_lang["v"]))
                         agent_text_parts.append(s)

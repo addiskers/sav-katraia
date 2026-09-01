@@ -19,15 +19,8 @@ class MediaHandler {
     this.outputAnalyser = null;
     this.outputGain = null;
 
-    // Half-duplex: gate mic uplink while agent PCM is playing (prevents echo STT).
-    this.micGateUntil = 0;
     // Drop in-flight PCM briefly after a real barge-in interrupt.
     this.playbackMuted = false;
-  }
-
-  isMicGated() {
-    if (!this.audioContext) return false;
-    return this.audioContext.currentTime < (this.micGateUntil || 0);
   }
 
   async initializeAudio() {
@@ -233,10 +226,7 @@ class MediaHandler {
     const now = this.audioContext.currentTime;
     this.nextStartTime = Math.max(now, this.nextStartTime);
     source.start(this.nextStartTime);
-    const endAt = this.nextStartTime + buffer.duration;
-    this.nextStartTime = endAt;
-    // Keep mic muted until playback finishes (+ small tail for echo decay).
-    this.micGateUntil = Math.max(this.micGateUntil || 0, endAt + 0.15);
+    this.nextStartTime += buffer.duration;
 
     this.scheduledSources.push(source);
     source.onended = () => {
@@ -248,7 +238,6 @@ class MediaHandler {
   stopAudioPlayback() {
     // Mute playback to drop any audio chunks still in-flight from server
     this.playbackMuted = true;
-    this.micGateUntil = 0;
     if (this.outputGain) {
       try {
         this.outputGain.gain.cancelScheduledValues(this.audioContext.currentTime);

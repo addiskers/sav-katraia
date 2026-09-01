@@ -456,7 +456,7 @@ connectBtn.onclick = async () => {
 async function startMic() {
   try {
     await mediaHandler.startAudio((data) => {
-      if (sarvamClient.isConnected() && !mediaHandler.isMicGated()) {
+      if (sarvamClient.isConnected()) {
         sarvamClient.send(data);
       }
     });

@@ -422,13 +422,11 @@ def _allows_turn(score, min_confidence):
     return score is not None and score >= min_confidence
 
 
-def _allows_barge_in(text: str, *, agent_speaking: bool, recent_agent: str) -> bool:
-    """Whether to interrupt the agent for this utterance."""
+def _allows_barge_in(text: str, *, recent_agent: str) -> bool:
+    """Whether to interrupt the in-flight agent turn for this utterance."""
     ok, _ = _utterance_structure_ok(text)
     if not ok:
         return False
-    if not agent_speaking:
-        return True
     if _is_echo_of_agent(text, recent_agent):
         return False
     if _is_ack_only(text):
@@ -785,9 +783,7 @@ class VoiceAgent:
 
             agent_active = speaking["on"] or agent_busy["v"]
             if agent_active and not _allows_barge_in(
-                text,
-                agent_speaking=speaking["on"],
-                recent_agent=recent_agent["text"],
+                text, recent_agent=recent_agent["text"],
             ):
                 logger.info(f"Barge-in ignored (echo/ack): text={text!r}")
                 return False
@@ -840,7 +836,7 @@ class VoiceAgent:
                 "model": model,
                 "messages": msgs,
                 "temperature": 0.4,
-                "max_tokens": 180,
+                "max_tokens": 220,
                 "tools": self.tools,
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -1054,8 +1050,8 @@ class VoiceAgent:
             sender_done_at = {"t": None}
             last_audio_at = {"t": 0.0}
             got_audio = {"v": False}
-            flush_timeout = float(os.getenv("TTS_FLUSH_TIMEOUT_S", "12"))
-            idle_after_flush = float(os.getenv("TTS_IDLE_AFTER_FLUSH_S", "0.8"))
+            flush_timeout = float(os.getenv("TTS_FLUSH_TIMEOUT_S", "15"))
+            idle_after_flush = float(os.getenv("TTS_IDLE_AFTER_FLUSH_S", "2.5"))
 
             try:
                 async with tts_lock:
@@ -1378,6 +1374,8 @@ class VoiceAgent:
                     content = _sanitize_speech("".join(agent_text_parts).strip())
                     if content:
                         messages.append({"role": "assistant", "content": content})
+                    elif not tool_calls:
+                        logger.warning("Agent turn produced no speech text")
                     await emit({"type": "turn_complete"})
                     return
             finally:

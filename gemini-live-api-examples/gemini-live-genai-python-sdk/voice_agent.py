@@ -504,11 +504,28 @@ def _has_interrupt_intent(text: str) -> bool:
 
 
 def _sanitize_speech(text: str) -> str:
-    """Strip parenthetical stage directions the LLM sometimes emits."""
+    """Strip stage directions, markdown, and other non-speech artifacts."""
     if not text:
         return text
     cleaned = re.sub(r"\([^)]*\)", "", text)
+    # LLM markdown must never reach TTS ("**बॉक्स**" gets read aloud).
+    cleaned = re.sub(r"[*_`#]+", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+# gpt-oss reasoning-channel leak: internal analysis streamed as content.
+# These phrases never occur in legitimate spoken replies.
+_REASONING_LEAK_RE = re.compile(
+    r"\b(the assistant|the instruction|the user (says|said|asked|wants)|"
+    r"must correct|let'?s produce|final answer|should say|we need to|"
+    r"the context indicates|per the instruction|i will (remain|stay) silent|"
+    r"respond with|the customer (has )?asked me)\b",
+    re.I,
+)
+
+
+def _looks_like_reasoning_leak(text: str) -> bool:
+    return bool(_REASONING_LEAK_RE.search(text or ""))
 
 
 # TTS pronunciation lexicon: Bulbul's Indic voices garble Latin-script brand
@@ -898,10 +915,11 @@ class VoiceAgent:
                 }
                 # gpt-oss is a reasoning model: cap thinking so it can't burn
                 # the whole token budget reasoning and return empty speech.
-                # low = fastest but degenerates (looped tokens spoken aloud);
-                # medium keeps answers coherent. Env-tunable.
+                # exclude=True: never stream reasoning deltas back to us.
                 payload["reasoning"] = {
-                    "effort": os.getenv("LLM_REASONING_EFFORT", "medium")}
+                    "effort": os.getenv("LLM_REASONING_EFFORT", "medium"),
+                    "exclude": True,
+                }
 
             headers = {
                 "Authorization": f"Bearer {llm_key}",
@@ -1389,6 +1407,10 @@ class VoiceAgent:
                         nonlocal speak_task
                         s = _sanitize_speech(s)
                         if not s:
+                            return
+                        if _looks_like_reasoning_leak(s):
+                            logger.warning(
+                                f"Dropped reasoning leak from speech: {s!r}")
                             return
                         if not started_speaking["v"]:
                             started_speaking["v"] = True

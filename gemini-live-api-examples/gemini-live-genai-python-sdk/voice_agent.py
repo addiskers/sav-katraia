@@ -898,7 +898,10 @@ class VoiceAgent:
                 }
                 # gpt-oss is a reasoning model: cap thinking so it can't burn
                 # the whole token budget reasoning and return empty speech.
-                payload["reasoning"] = {"effort": "low"}
+                # low = fastest but degenerates (looped tokens spoken aloud);
+                # medium keeps answers coherent. Env-tunable.
+                payload["reasoning"] = {
+                    "effort": os.getenv("LLM_REASONING_EFFORT", "medium")}
 
             headers = {
                 "Authorization": f"Bearer {llm_key}",

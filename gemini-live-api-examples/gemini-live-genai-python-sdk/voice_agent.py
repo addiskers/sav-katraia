@@ -56,9 +56,9 @@ logger = logging.getLogger(__name__)
 # not import time, because main.py imports this module before load_dotenv().
 # Legacy GROQ_* names remain as fallbacks.
 DEFAULT_LLM_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Non-reasoning model: no thinking channel to leak into speech, no
-# reasoning-token burn, no harmony-format degeneration. Tools work on Groq.
-DEFAULT_LLM_MODEL = "meta-llama/llama-3.3-70b-instruct"
+# Non-reasoning, strong Hindi, fast TTFT — and the system prompt was written
+# for Gemini Live, so Gemini Flash follows it best.
+DEFAULT_LLM_MODEL = "google/gemini-2.5-flash"
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
 SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
@@ -909,12 +909,13 @@ class VoiceAgent:
                 "stream_options": {"include_usage": True},
             }
             if use_openrouter:
-                # Fastest measured route: Groq TTFT beat Cerebras for this prompt.
-                # Cerebras stays as high-tok/s fallback if Groq is rate-limited.
-                payload["provider"] = {
-                    "order": ["Groq", "Cerebras"],
-                    "allow_fallbacks": True,
-                }
+                # Groq/Cerebras routing only applies to models they host —
+                # forcing it on Gemini/other models slows or breaks routing.
+                if any(k in model for k in ("llama", "gpt-oss", "qwen", "kimi")):
+                    payload["provider"] = {
+                        "order": ["Groq", "Cerebras"],
+                        "allow_fallbacks": True,
+                    }
                 # Reasoning models only (gpt-oss/deepseek-r1): cap thinking and
                 # never stream reasoning deltas back (they leaked into speech).
                 if "gpt-oss" in model or "deepseek-r1" in model or "/o1" in model:
@@ -937,6 +938,8 @@ class VoiceAgent:
             pending = ""      # spoken text not yet flushed as a sentence
             finish_reason = None
             emitted_any = False  # True after first TTS chunk was handed off
+            req_start = time.monotonic()
+            first_token_at = {"t": None}
 
             async def flush_sentences(force=False):
                 nonlocal pending, emitted_any
@@ -1003,6 +1006,11 @@ class VoiceAgent:
                                 finish_reason = ch["finish_reason"]
                             piece = delta.get("content")
                             if piece:
+                                if first_token_at["t"] is None:
+                                    first_token_at["t"] = time.monotonic()
+                                    logger.info(
+                                        f"LLM TTFT: "
+                                        f"{first_token_at['t'] - req_start:.2f}s")
                                 content_parts.append(piece)
                                 pending += piece
                                 await flush_sentences(force=False)
@@ -1089,26 +1097,18 @@ class VoiceAgent:
                     open_timeout=20, close_timeout=5)
                 tts["lang"] = None
             if tts["lang"] != lang:
-                config_data = {
-                    "language_code": lang,
-                    "target_language_code": lang,
-                    "speaker": TTS_SPEAKER,
-                    "model": TTS_MODEL,
-                    "speech_sample_rate": str(TTS_SAMPLE_RATE),
-                    "output_audio_codec": "linear16",
-                    "min_buffer_size": 30,
-                    "max_chunk_length": 80,
-                }
-                # Optional voice tuning (only sent when set in .env).
-                loudness = os.getenv("SARVAM_TTS_LOUDNESS", "").strip()
-                if loudness:
-                    config_data["loudness"] = float(loudness)
-                pace = os.getenv("SARVAM_TTS_PACE", "").strip()
-                if pace:
-                    config_data["pace"] = float(pace)
                 await tts["ws"].send(json.dumps({
                     "type": "config",
-                    "data": config_data,
+                    "data": {
+                        "language_code": lang,
+                        "target_language_code": lang,
+                        "speaker": TTS_SPEAKER,
+                        "model": TTS_MODEL,
+                        "speech_sample_rate": str(TTS_SAMPLE_RATE),
+                        "output_audio_codec": "linear16",
+                        "min_buffer_size": 30,
+                        "max_chunk_length": 80,
+                    },
                 }))
                 tts["lang"] = lang
             return tts["ws"]
@@ -1294,7 +1294,8 @@ class VoiceAgent:
                     "max_tokens": 1,
                     "temperature": 0,
                 }
-                if use_openrouter:
+                if use_openrouter and any(
+                        k in model for k in ("llama", "gpt-oss", "qwen", "kimi")):
                     payload["provider"] = {
                         "order": ["Groq", "Cerebras"],
                         "allow_fallbacks": True,

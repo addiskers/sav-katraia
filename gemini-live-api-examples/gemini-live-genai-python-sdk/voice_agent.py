@@ -439,6 +439,26 @@ def _allows_barge_in(text: str, *, recent_agent: str) -> bool:
     return False
 
 
+def _interim_allows_barge_in(text: str, recent_agent: str) -> bool:
+    """Fast barge-in on interim transcripts while the agent is speaking.
+
+    Stricter than final-transcript barge-in: interims are noisier, so require
+    a real multi-word utterance (or explicit interrupt intent) that is not an
+    echo of the agent's own TTS.
+    """
+    ok, _ = _utterance_structure_ok(text)
+    if not ok:
+        return False
+    if _is_echo_of_agent(text, recent_agent):
+        return False
+    if _is_ack_only(text):
+        return False
+    if _has_interrupt_intent(text):
+        return True
+    words = [w for w in re.split(r"\s+", text.strip()) if w]
+    return len(words) >= 3
+
+
 def _normalize_echo_text(text: str) -> str:
     return re.sub(r"[^\w\s]", " ", (text or "").lower())
 
@@ -449,13 +469,13 @@ def _is_echo_of_agent(user_text: str, agent_text: str) -> bool:
     a = _normalize_echo_text(agent_text)
     if not u or not a:
         return False
-    if len(u) >= 8 and (u in a or a in u):
+    if len(u) >= 12 and (u in a or a in u):
         return True
     u_words = [w for w in u.split() if len(w) > 1]
     a_words = set(w for w in a.split() if len(w) > 1)
-    if len(u_words) >= 2 and a_words:
+    if len(u_words) >= 3 and a_words:
         overlap = sum(1 for w in u_words if w in a_words) / len(u_words)
-        if overlap >= 0.55:
+        if overlap >= 0.7:
             return True
     return False
 
@@ -489,6 +509,28 @@ def _sanitize_speech(text: str) -> str:
         return text
     cleaned = re.sub(r"\([^)]*\)", "", text)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+# TTS pronunciation lexicon: Bulbul's Indic voices garble Latin-script brand
+# names (e.g. "Suzuki" -> "Sogeni"). Send them in Devanagari for Indic langs.
+_TTS_DEVANAGARI_LEXICON = [
+    (re.compile(r"maruti\s+suzuki", re.I), "मारुति सुज़ुकी"),
+    (re.compile(r"\bsuzuki\b", re.I), "सुज़ुकी"),
+    (re.compile(r"\bmaruti\b", re.I), "मारुति"),
+    (re.compile(r"\bbaleno\b", re.I), "बलेनो"),
+    (re.compile(r"\bkataria\b", re.I), "कटारिया"),
+    (re.compile(r"\bautomobiles\b", re.I), "ऑटोमोबाइल्स"),
+    (re.compile(r"\bahmedabad\b", re.I), "अहमदाबाद"),
+]
+
+
+def _tts_pronounce(text: str, lang: str) -> str:
+    """Rewrite brand names for correct TTS pronunciation (Indic langs only)."""
+    if not text or lang == "en-IN":
+        return text
+    for pat, rep in _TTS_DEVANAGARI_LEXICON:
+        text = pat.sub(rep, text)
+    return text
 
 
 def _resolve_llm_config():
@@ -718,18 +760,24 @@ class VoiceAgent:
                                     text = (alt.get("transcript") or "").strip()
                                     if not text:
                                         continue
-                                    # Do NOT hard-cancel on interim text — wait for a
-                                    # validated speech_final in _finish_utterance.
-                                    if msg.get("is_final"):
-                                        pending_final.append({
-                                            "text": text,
-                                            "confidence": alt.get("confidence"),
-                                            "words": alt.get("words") or [],
-                                        })
-                                        if msg.get("speech_final"):
-                                            await _finish_utterance(
-                                                pending_final, try_barge_in=True)
-                                            pending_final = []
+                                    if not msg.get("is_final"):
+                                        # Fast barge-in: stop agent audio as soon
+                                        # as a real multi-word interim shows up,
+                                        # instead of waiting for speech_final.
+                                        if speaking["on"] and _interim_allows_barge_in(
+                                                text, recent_agent["text"]):
+                                            await interrupt_agent(
+                                                "interim", force=True)
+                                        continue
+                                    pending_final.append({
+                                        "text": text,
+                                        "confidence": alt.get("confidence"),
+                                        "words": alt.get("words") or [],
+                                    })
+                                    if msg.get("speech_final"):
+                                        await _finish_utterance(
+                                            pending_final, try_barge_in=True)
+                                        pending_final = []
                                 elif mtype == "UtteranceEnd":
                                     await _finish_utterance(
                                         pending_final, try_barge_in=True)
@@ -1056,6 +1104,7 @@ class VoiceAgent:
             sender_done_at = {"t": None}
             last_audio_at = {"t": 0.0}
             got_audio = {"v": False}
+            clean_final = {"v": False}
             flush_timeout = float(os.getenv("TTS_FLUSH_TIMEOUT_S", "15"))
             idle_after_flush = float(os.getenv("TTS_IDLE_AFTER_FLUSH_S", "2.5"))
 
@@ -1074,6 +1123,7 @@ class VoiceAgent:
                                 return
                             if not sentence.strip():
                                 continue
+                            sentence = _tts_pronounce(sentence, lang)
                             chars_sent += len(sentence)
                             await ws.send(json.dumps({
                                 "type": "text",
@@ -1123,6 +1173,7 @@ class VoiceAgent:
                             elif mtype == "event":
                                 et = (msg.get("data") or {}).get("event_type")
                                 if et == "final" and sender_done.is_set():
+                                    clean_final["v"] = True
                                     break
                             elif mtype == "error":
                                 err = (msg.get("data") or {}).get("message") or str(msg)
@@ -1134,6 +1185,13 @@ class VoiceAgent:
                                 await send_task
                             except (asyncio.CancelledError, Exception):
                                 pass
+                    # If we exited on a timeout (not a clean flush-final), the
+                    # socket may still hold undelivered frames from THIS turn.
+                    # Reusing it would poison the NEXT turn with stale audio
+                    # and stray `final` events (heard as cut-offs / wrong audio).
+                    if not clean_final["v"]:
+                        logger.info("Sarvam TTS: unclean stream end — closing WS")
+                        await _close_tts()
             except asyncio.CancelledError:
                 # Close dirty mid-stream socket, rewarm in background during LLM time.
                 speaking["on"] = False

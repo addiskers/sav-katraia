@@ -56,7 +56,9 @@ logger = logging.getLogger(__name__)
 # not import time, because main.py imports this module before load_dotenv().
 # Legacy GROQ_* names remain as fallbacks.
 DEFAULT_LLM_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
+# Non-reasoning model: no thinking channel to leak into speech, no
+# reasoning-token burn, no harmony-format degeneration. Tools work on Groq.
+DEFAULT_LLM_MODEL = "meta-llama/llama-3.3-70b-instruct"
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
 SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
@@ -913,13 +915,13 @@ class VoiceAgent:
                     "order": ["Groq", "Cerebras"],
                     "allow_fallbacks": True,
                 }
-                # gpt-oss is a reasoning model: cap thinking so it can't burn
-                # the whole token budget reasoning and return empty speech.
-                # exclude=True: never stream reasoning deltas back to us.
-                payload["reasoning"] = {
-                    "effort": os.getenv("LLM_REASONING_EFFORT", "medium"),
-                    "exclude": True,
-                }
+                # Reasoning models only (gpt-oss/deepseek-r1): cap thinking and
+                # never stream reasoning deltas back (they leaked into speech).
+                if "gpt-oss" in model or "deepseek-r1" in model or "/o1" in model:
+                    payload["reasoning"] = {
+                        "effort": os.getenv("LLM_REASONING_EFFORT", "medium"),
+                        "exclude": True,
+                    }
 
             headers = {
                 "Authorization": f"Bearer {llm_key}",

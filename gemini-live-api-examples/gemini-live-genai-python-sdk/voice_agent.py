@@ -1089,18 +1089,26 @@ class VoiceAgent:
                     open_timeout=20, close_timeout=5)
                 tts["lang"] = None
             if tts["lang"] != lang:
+                config_data = {
+                    "language_code": lang,
+                    "target_language_code": lang,
+                    "speaker": TTS_SPEAKER,
+                    "model": TTS_MODEL,
+                    "speech_sample_rate": str(TTS_SAMPLE_RATE),
+                    "output_audio_codec": "linear16",
+                    "min_buffer_size": 30,
+                    "max_chunk_length": 80,
+                }
+                # Optional voice tuning (only sent when set in .env).
+                loudness = os.getenv("SARVAM_TTS_LOUDNESS", "").strip()
+                if loudness:
+                    config_data["loudness"] = float(loudness)
+                pace = os.getenv("SARVAM_TTS_PACE", "").strip()
+                if pace:
+                    config_data["pace"] = float(pace)
                 await tts["ws"].send(json.dumps({
                     "type": "config",
-                    "data": {
-                        "language_code": lang,
-                        "target_language_code": lang,
-                        "speaker": TTS_SPEAKER,
-                        "model": TTS_MODEL,
-                        "speech_sample_rate": str(TTS_SAMPLE_RATE),
-                        "output_audio_codec": "linear16",
-                        "min_buffer_size": 30,
-                        "max_chunk_length": 80,
-                    },
+                    "data": config_data,
                 }))
                 tts["lang"] = lang
             return tts["ws"]
